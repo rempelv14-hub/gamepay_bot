@@ -57,6 +57,23 @@ def back_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")]])
 
 
+def support_panel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📝 Создать тикет", callback_data="support_create")],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_menu")],
+        ]
+    )
+
+
+def admin_ticket_kb(ticket_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"admin_ticket_close:{ticket_id}")],
+        ]
+    )
+
+
 def stars_packages_kb() -> InlineKeyboardMarkup:
     rows = []
     items = list(STARS_PACKAGES.items())
