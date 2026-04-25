@@ -108,10 +108,20 @@ def top_up_kb() -> InlineKeyboardMarkup:
 def payment_choice_kb(price: float) -> InlineKeyboardMarkup:
     buttons = []
     if price > 0:
+        buttons.append([InlineKeyboardButton(text="💎 Оплатить TON автоматически", callback_data="pay:ton")])
         buttons.append([InlineKeyboardButton(text="💰 Оплатить с баланса", callback_data="pay:balance")])
     buttons.append([InlineKeyboardButton(text="🧾 Создать заявку / оплата вручную", callback_data="pay:manual")])
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def ton_invoice_kb(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔎 Проверить TON оплату", callback_data=f"ton_check:{order_id}")],
+            [InlineKeyboardButton(text="⬅️ Меню", callback_data="back_menu")],
+        ]
+    )
 
 
 def profile_kb() -> InlineKeyboardMarkup:
