@@ -309,6 +309,27 @@ def create_support_ticket(user_id: int, username: str | None, message: str) -> i
     return ticket_id
 
 
+def count_user_support_tickets(user_id: int) -> dict[str, int]:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM support_tickets WHERE user_id=?", (user_id,))
+    total = int(cur.fetchone()[0] or 0)
+    cur.execute("SELECT COUNT(*) FROM support_tickets WHERE user_id=? AND status='open'", (user_id,))
+    open_count = int(cur.fetchone()[0] or 0)
+    conn.close()
+    return {"total": total, "open": open_count}
+
+
+def close_support_ticket(ticket_id: int) -> bool:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE support_tickets SET status='closed' WHERE id=?", (ticket_id,))
+    changed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
 def get_stats() -> dict[str, Any]:
     conn = db_connect()
     cur = conn.cursor()
