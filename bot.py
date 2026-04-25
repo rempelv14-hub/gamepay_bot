@@ -257,6 +257,14 @@ async def start_handler(message: Message, command: CommandObject) -> None:
     await send_main_menu(message)
 
 
+@router.message(Command("check_support"))
+async def check_support_handler(message: Message) -> None:
+    await message.answer(
+        f"SUPPORT_USERNAME сейчас: @{safe(settings.support_username)}\n"
+        f"Railway должен быть: SUPPORT_USERNAME={safe(settings.support_username)}"
+    )
+
+
 @router.message(Command("menu"))
 @router.message(F.text == "📋 Меню")
 async def menu_handler(message: Message, state: FSMContext) -> None:
