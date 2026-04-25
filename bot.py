@@ -30,6 +30,10 @@ from database import (
     list_orders,
     mark_reward_paid,
     top_clients,
+    create_ton_invoice,
+    get_ton_invoice_by_order,
+    list_pending_ton_invoices,
+    mark_ton_invoice_paid,
     update_order_status,
     upsert_user,
 )
@@ -48,10 +52,12 @@ from keyboards import (
     pubg_packages_kb,
     stars_packages_kb,
     top_up_kb,
+    ton_invoice_kb,
 )
 from products import CUSTOM_PRODUCTS, PREMIUM_PACKAGES, PUBG_PACKAGES, STARS_PACKAGES
 from states import AdminBroadcastFSM, AdminPromoFSM, CalculatorFSM, OrderFSM, PromoFSM, PubgFSM, SupportFSM, TopUpFSM
 from texts import INFO_TEXT, MENU_TEXT
+from ton_payments import find_ton_payment, kzt_to_ton, ton_invoice_comment, ton_is_configured
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger("shop_bot")
@@ -75,7 +81,8 @@ def safe(text: Any) -> str:
 def order_status_ru(status: str) -> str:
     return {
         "new": "новый / ждёт ручной оплаты",
-        "paid": "оплачен с баланса",
+        "paid": "оплачен",
+        "waiting_ton": "ожидает TON оплату",
         "work": "в работе",
         "done": "выполнен",
         "cancelled": "отменён",
@@ -413,18 +420,59 @@ async def order_details_handler(message: Message, state: FSMContext) -> None:
     if len(text) < 3:
         await message.answer("Напишите детали заказа подробнее.")
         return
+
     data = await state.get_data()
     await state.update_data(details=text)
-    await state.set_state(OrderFSM.waiting_payment)
     price = float(data.get("price", 0) or 0)
     product = data.get("product", "Заявка")
-    price_text = money(price) if price > 0 else "по договорённости"
+
+    if price <= 0:
+        await state.set_state(OrderFSM.waiting_custom_price)
+        await message.answer(
+            f"<b>{safe(product)}</b>\n\n"
+            f"📝 Детали: {safe(text)}\n\n"
+            "Введите сумму заказа в тенге, чтобы бот создал TON-оплату.\n"
+            "Пример: <code>2500</code>",
+            reply_markup=back_menu_kb(),
+        )
+        return
+
+    await state.set_state(OrderFSM.waiting_payment)
     await message.answer(
         f"<b>Проверьте заявку</b>\n\n"
         f"📦 Товар: <b>{safe(product)}</b>\n"
-        f"💵 Цена: <b>{price_text}</b>\n"
+        f"💵 Цена: <b>{money(price)}</b>\n"
         f"📝 Детали: {safe(text)}\n\n"
         f"Выберите способ оформления:",
+        reply_markup=payment_choice_kb(price),
+    )
+
+
+@router.message(OrderFSM.waiting_custom_price)
+async def order_custom_price_handler(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").replace(" ", "").replace(",", ".")
+    try:
+        price = float(raw)
+    except ValueError:
+        await message.answer("Введите сумму цифрами. Пример: 2500")
+        return
+
+    if price <= 0:
+        await message.answer("Сумма должна быть больше 0.")
+        return
+
+    data = await state.get_data()
+    await state.update_data(price=price)
+    await state.set_state(OrderFSM.waiting_payment)
+
+    product = data.get("product", "Заявка")
+    details = data.get("details", "")
+    await message.answer(
+        f"<b>Проверьте заявку</b>\n\n"
+        f"📦 Товар: <b>{safe(product)}</b>\n"
+        f"💵 Цена: <b>{money(price)}</b>\n"
+        f"📝 Детали: {safe(details)}\n\n"
+        "Выберите способ оформления:",
         reply_markup=payment_choice_kb(price),
     )
 
@@ -504,12 +552,16 @@ async def top_up_handler(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("topup_amount:"))
 async def topup_amount_handler(callback: CallbackQuery, state: FSMContext) -> None:
     amount = float(callback.data.split(":", 1)[1])
-    await state.set_state(TopUpFSM.waiting_receipt)
-    await state.update_data(amount=amount)
-    await callback.message.answer(
-        f"Сумма пополнения: <b>{money(amount)}</b>\n\n"
-        f"Оплатите по реквизитам:\n<blockquote>{safe(settings.payment_details)}</blockquote>\n\n"
-        f"После оплаты отправьте сюда текст/номер чека или фото одним сообщением."
+    await create_ton_payment_order(
+        bot=callback.bot,
+        user_id=callback.from_user.id,
+        username=callback.from_user.username,
+        category="top_up",
+        product="Пополнение баланса",
+        details=f"TON-пополнение баланса на {money(amount)}",
+        price=amount,
+        target_message=callback.message,
+        state=state,
     )
     await callback.answer()
 
@@ -532,58 +584,17 @@ async def topup_custom_amount_handler(message: Message, state: FSMContext) -> No
     if amount <= 0:
         await message.answer("Сумма должна быть больше 0.")
         return
-    await state.set_state(TopUpFSM.waiting_receipt)
-    await state.update_data(amount=amount)
-    await message.answer(
-        f"Сумма пополнения: <b>{money(amount)}</b>\n\n"
-        f"Оплатите по реквизитам:\n<blockquote>{safe(settings.payment_details)}</blockquote>\n\n"
-        f"После оплаты отправьте сюда текст/номер чека или фото одним сообщением."
-    )
-
-
-@router.message(TopUpFSM.waiting_receipt)
-async def topup_receipt_handler(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    amount = float(data.get("amount", 0) or 0)
-    if amount <= 0:
-        await state.clear()
-        await message.answer("Ошибка суммы. Начните пополнение заново.", reply_markup=top_up_kb())
-        return
-
-    if message.photo:
-        receipt = "Пользователь отправил фото чека. Проверьте в чате с ботом."
-    else:
-        receipt = (message.text or "").strip() or "Без текста"
-
-    order_id = create_order(
+    await create_ton_payment_order(
+        bot=message.bot,
         user_id=message.from_user.id,
         username=message.from_user.username,
         category="top_up",
         product="Пополнение баланса",
-        details=f"Сумма: {money(amount)}. Чек/комментарий: {receipt}",
+        details=f"TON-пополнение баланса на {money(amount)}",
         price=amount,
-        payment_method="manual",
-        status="new",
+        target_message=message,
+        state=state,
     )
-    await notify_admin_order(message.bot, order_id)
-    if settings.admin_id and message.photo:
-        try:
-            await message.bot.copy_message(
-                chat_id=settings.admin_id,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id,
-                caption=f"🧾 Копия чека по заявке #{order_id}",
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Cannot copy receipt for order %s: %s", order_id, exc)
-    await state.clear()
-    await message.answer(
-        f"✅ Заявка на пополнение <b>#{order_id}</b> создана.\n"
-        f"После проверки администратор начислит <b>{money(amount)}</b> на баланс.",
-        reply_markup=back_menu_kb(),
-    )
-
-
 @router.callback_query(F.data == "promo")
 async def promo_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PromoFSM.waiting_code)
@@ -985,6 +996,172 @@ async def fallback_handler(message: Message) -> None:
     await message.answer("Выберите действие в меню или используйте /menu.", reply_markup=bottom_menu_kb())
 
 
+# =========================
+# TON AUTO PAYMENT HELPERS
+# =========================
+
+async def create_ton_payment_order(
+    bot: Bot,
+    user_id: int,
+    username: str | None,
+    category: str,
+    product: str,
+    details: str,
+    price: float,
+    target_message: Message,
+    state: FSMContext | None = None,
+) -> None:
+    if price <= 0:
+        await target_message.answer(
+            "❌ Для автоматической TON-оплаты у товара должна быть фиксированная цена.\n"
+            "Этот раздел пока оформляется через заявку.",
+            reply_markup=back_menu_kb(),
+        )
+        return
+
+    if not ton_is_configured():
+        await target_message.answer(
+            "❌ TON-оплата пока не настроена.\n\n"
+            "В Railway нужно добавить TON_WALLET, TON_API_KEY и TON_RATE_KZT.",
+            reply_markup=back_menu_kb(),
+        )
+        return
+
+    order_id = create_order(
+        user_id=user_id,
+        username=username,
+        category=category,
+        product=product,
+        details=details,
+        price=price,
+        payment_method="TON",
+        status="waiting_ton",
+    )
+    amount_ton = kzt_to_ton(price)
+    comment = ton_invoice_comment(order_id, user_id)
+    create_ton_invoice(order_id, user_id, price, amount_ton, comment)
+
+    if state:
+        await state.clear()
+
+    await target_message.answer(
+        f"💎 <b>TON-оплата заказа #{order_id}</b>\n\n"
+        f"📦 Товар: <b>{safe(product)}</b>\n"
+        f"💵 Сумма: <b>{money(price)}</b>\n"
+        f"💎 К оплате: <b>{amount_ton:g} TON</b>\n\n"
+        f"Отправьте ровно или больше <b>{amount_ton:g} TON</b> на адрес:\n"
+        f"<code>{safe(settings.ton_wallet)}</code>\n\n"
+        f"Комментарий к платежу обязательно:\n"
+        f"<code>{safe(comment)}</code>\n\n"
+        "После оплаты нажмите кнопку проверки. Бот также сам периодически проверяет оплату.",
+        reply_markup=ton_invoice_kb(order_id),
+    )
+
+
+async def process_ton_paid_order(bot: Bot, order_id: int, tx_hash: str, amount_ton: float) -> bool:
+    order = get_order(order_id)
+    if not order or order["status"] != "waiting_ton":
+        return False
+
+    mark_ton_invoice_paid(order_id, tx_hash, amount_ton)
+
+    if order["category"] == "top_up":
+        change_balance(int(order["user_id"]), float(order["price"] or 0), f"TON пополнение по заявке #{order_id}", order_id)
+        update_order_status(order_id, "done")
+        try:
+            await bot.send_message(
+                int(order["user_id"]),
+                f"✅ TON-оплата найдена. Баланс пополнен на <b>{money(float(order['price'] or 0))}</b>.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Cannot notify topup user %s: %s", order["user_id"], exc)
+        if settings.admin_id:
+            try:
+                await bot.send_message(settings.admin_id, f"💎 TON-пополнение #{order_id} оплачено автоматически.")
+            except Exception:
+                pass
+        return True
+
+    update_order_status(order_id, "paid")
+    paid_order = get_order(order_id)
+
+    try:
+        await bot.send_message(
+            int(order["user_id"]),
+            f"✅ TON-оплата по заказу <b>#{order_id}</b> найдена.\n\n"
+            "Заказ оплачен и передан в обработку.",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Cannot notify user %s: %s", order["user_id"], exc)
+
+    if settings.admin_id and paid_order:
+        await bot.send_message(
+            settings.admin_id,
+            "💎 <b>Заказ оплачен через TON автоматически</b>\n\n" + format_order_for_admin(paid_order),
+            reply_markup=admin_order_kb(order_id),
+        )
+    return True
+
+
+async def check_ton_invoice(bot: Bot, order_id: int) -> bool:
+    invoice = get_ton_invoice_by_order(order_id)
+    if not invoice or invoice["status"] != "pending":
+        return False
+    tx = await asyncio.to_thread(find_ton_payment, invoice["comment"], float(invoice["amount_ton"]))
+    if not tx:
+        return False
+    return await process_ton_paid_order(bot, order_id, str(tx["hash"]), float(tx["amount_ton"]))
+
+
+async def ton_auto_checker(bot: Bot) -> None:
+    while True:
+        try:
+            for invoice in list_pending_ton_invoices(limit=50):
+                await check_ton_invoice(bot, int(invoice["order_id"]))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("TON checker error: %s", exc)
+        await asyncio.sleep(45)
+
+
+@router.callback_query(StateFilter(OrderFSM.waiting_payment), F.data == "pay:ton")
+async def pay_ton_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    await create_ton_payment_order(
+        bot=callback.bot,
+        user_id=callback.from_user.id,
+        username=callback.from_user.username,
+        category=data.get("category", "order"),
+        product=data.get("product", "Заявка"),
+        details=data.get("details", ""),
+        price=float(data.get("price", 0) or 0),
+        target_message=callback.message,
+        state=state,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ton_check:"))
+async def ton_check_handler(callback: CallbackQuery) -> None:
+    order_id = int(callback.data.split(":", 1)[1])
+    order = get_order(order_id)
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    if int(order["user_id"]) != callback.from_user.id and not is_admin(callback.from_user.id):
+        await callback.answer("Это не ваш заказ", show_alert=True)
+        return
+    if order["status"] != "waiting_ton":
+        await callback.answer("Заказ уже не ожидает TON оплату", show_alert=True)
+        return
+
+    ok = await check_ton_invoice(callback.bot, order_id)
+    if ok:
+        await callback.message.answer(f"✅ Оплата заказа #{order_id} найдена.", reply_markup=back_menu_kb())
+        await callback.answer("Оплата найдена")
+    else:
+        await callback.answer("Платёж пока не найден. Проверьте сумму и комментарий.", show_alert=True)
+
+
 async def main() -> None:
     if not settings.bot_token:
         raise RuntimeError("Не указан BOT_TOKEN в .env")
@@ -993,6 +1170,12 @@ async def main() -> None:
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    if ton_is_configured():
+        asyncio.create_task(ton_auto_checker(bot))
+        logger.info("TON auto checker started")
+    else:
+        logger.warning("TON auto payments are not configured")
+
     logger.info("Bot started")
     await dp.start_polling(bot)
 
