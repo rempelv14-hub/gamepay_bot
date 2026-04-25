@@ -20,6 +20,8 @@ from database import (
     create_order,
     create_promocode,
     create_support_ticket,
+    count_user_support_tickets,
+    close_support_ticket,
     get_order,
     get_stats,
     get_user,
@@ -51,6 +53,8 @@ from keyboards import (
     profile_kb,
     pubg_packages_kb,
     stars_packages_kb,
+    support_panel_kb,
+    admin_ticket_kb,
     top_up_kb,
     ton_invoice_kb,
 )
@@ -622,11 +626,42 @@ async def promo_code_handler(message: Message, state: FSMContext) -> None:
         await message.answer(f"❌ {safe(result)}", reply_markup=back_menu_kb())
 
 
+def support_panel_text(user_id: int) -> str:
+    stats = count_user_support_tickets(user_id)
+    active = stats.get("open", 0)
+    total = stats.get("total", 0)
+    status_line = (
+        "✅ Вы можете создать новый тикет для обращения в поддержку."
+        if active == 0
+        else "⚠️ У вас уже есть активный тикет. Вы можете создать новый, если вопрос другой."
+    )
+    return (
+        "<b>📞 Техническая поддержка</b>\n\n"
+        "В этом разделе Вы можете создать тикет для связи с поддержкой.\n\n"
+        "<b>📊 Статистика:</b>\n"
+        f"• Активных тикетов: <b>{active}</b>\n"
+        f"• Всего тикетов: <b>{total}</b>\n\n"
+        f"{status_line}"
+    )
+
+
 @router.callback_query(F.data == "support")
 async def support_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.answer(
+        support_panel_text(callback.from_user.id),
+        reply_markup=support_panel_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "support_create")
+async def support_create_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SupportFSM.waiting_message)
     await callback.message.answer(
-        f"📞 Поддержка\n\nНапишите ваш вопрос одним сообщением.\nАдминистратор: @{safe(settings.support_username)}",
+        "<b>📝 Новый тикет</b>\n\n"
+        "Опишите проблему одним сообщением.\n"
+        "Например: что хотели купить, номер заказа, что не получилось или какую ошибку видите.",
         reply_markup=back_menu_kb(),
     )
     await callback.answer()
@@ -634,22 +669,48 @@ async def support_handler(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(SupportFSM.waiting_message)
 async def support_message_handler(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
+    text = (message.text or message.caption or "").strip()
     if len(text) < 3:
-        await message.answer("Напишите вопрос подробнее.")
+        await message.answer("Напишите вопрос подробнее одним сообщением.")
         return
+
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
     ticket_id = create_support_ticket(message.from_user.id, message.from_user.username, text)
+
     if settings.admin_id:
         await message.bot.send_message(
             settings.admin_id,
-            f"<b>📞 Новый вопрос в поддержку #{ticket_id}</b>\n\n"
+            f"<b>🆘 Новый тикет поддержки #{ticket_id}</b>\n\n"
             f"👤 Клиент: {user_mention(message.from_user.username, message.from_user.id)}\n"
-            f"🆔 <code>{message.from_user.id}</code>\n\n"
-            f"Сообщение:\n{safe(text)}\n\n"
-            f"Ответить можно командой:\n<code>/reply {message.from_user.id} ваш текст</code>",
+            f"🆔 User ID: <code>{message.from_user.id}</code>\n"
+            f"🔗 Username: @{safe(message.from_user.username) if message.from_user.username else 'не указан'}\n\n"
+            f"<b>Жалоба / вопрос:</b>\n{safe(text)}\n\n"
+            f"Ответить клиенту:\n<code>/reply {message.from_user.id} ваш текст</code>",
+            reply_markup=admin_ticket_kb(ticket_id),
         )
+
     await state.clear()
-    await message.answer("✅ Сообщение отправлено в поддержку. Скоро с вами свяжутся.", reply_markup=back_menu_kb())
+    await message.answer(
+        f"✅ Тикет <b>#{ticket_id}</b> создан.\n\n"
+        "Ваше сообщение отправлено администратору. Ожидайте ответа.",
+        reply_markup=back_menu_kb(),
+    )
+
+
+@router.callback_query(F.data.startswith("admin_ticket_close:"))
+async def admin_ticket_close_handler(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    ticket_id = int(callback.data.split(":", 1)[1])
+    ok = close_support_ticket(ticket_id)
+    if not ok:
+        await callback.answer("Тикет не найден", show_alert=True)
+        return
+
+    await callback.message.edit_text((callback.message.text or "") + "\n\n✅ Тикет закрыт администратором.")
+    await callback.answer("Тикет закрыт")
 
 
 @router.callback_query(F.data == "calculator")
