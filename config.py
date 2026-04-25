@@ -32,10 +32,16 @@ class Settings:
         "PAYMENT_DETAILS",
         "Укажите реквизиты в .env: PAYMENT_DETAILS=Kaspi/карта/инструкция оплаты"
     ).strip()
-    currency_symbol: str = os.getenv("CURRENCY_SYMBOL", "₽").strip()
+    currency_symbol: str = os.getenv("CURRENCY_SYMBOL", "₸").strip()
     referral_bonus_percent: float = _float("REFERRAL_BONUS_PERCENT", 5.0)
     db_path: str = os.getenv("BOT_DB_PATH", "data/bot.db").strip()
     bot_username: str = os.getenv("BOT_USERNAME", "").strip().lstrip('@')
+
+    # TON auto-payments
+    ton_wallet: str = os.getenv("TON_WALLET", "").strip()
+    ton_api_key: str = os.getenv("TON_API_KEY", "").strip()
+    ton_rate_kzt: float = _float("TON_RATE_KZT", 1200.0)
+    ton_check_limit: int = _int("TON_CHECK_LIMIT", 50)
 
 
 settings = Settings()
