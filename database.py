@@ -111,6 +111,7 @@ def init_db() -> None:
 
     conn.commit()
     conn.close()
+    ensure_ton_tables()
 
 
 def upsert_user(user_id: int, username: str | None, full_name: str | None, ref_by: int | None = None) -> None:
@@ -377,3 +378,116 @@ def get_user_activity_stats(user_id: int) -> dict[str, Any]:
         "total_spent": float(order_row["total_spent"] or 0),
         "refs_count": int(ref_row["refs_count"] or 0),
     }
+
+# =========================
+# TON INVOICES
+# =========================
+
+def ensure_ton_tables() -> None:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ton_invoices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            amount_kzt REAL NOT NULL,
+            amount_ton REAL NOT NULL,
+            comment TEXT NOT NULL UNIQUE,
+            status TEXT DEFAULT 'pending',
+            tx_hash TEXT,
+            created_at TEXT NOT NULL,
+            paid_at TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ton_used_transactions (
+            tx_hash TEXT PRIMARY KEY,
+            order_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            amount_ton REAL NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def create_ton_invoice(order_id: int, user_id: int, amount_kzt: float, amount_ton: float, comment: str) -> int:
+    ensure_ton_tables()
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO ton_invoices (order_id, user_id, amount_kzt, amount_ton, comment, status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?)
+        """,
+        (order_id, user_id, float(amount_kzt), float(amount_ton), comment, now()),
+    )
+    invoice_id = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return invoice_id
+
+
+def get_ton_invoice_by_order(order_id: int):
+    ensure_ton_tables()
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM ton_invoices WHERE order_id=? ORDER BY id DESC LIMIT 1", (order_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_ton_invoice_by_comment(comment: str):
+    ensure_ton_tables()
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM ton_invoices WHERE comment=?", (comment,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def list_pending_ton_invoices(limit: int = 100):
+    ensure_ton_tables()
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM ton_invoices WHERE status='pending' ORDER BY created_at ASC LIMIT ?", (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def is_ton_tx_used(tx_hash: str) -> bool:
+    ensure_ton_tables()
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM ton_used_transactions WHERE tx_hash=?", (tx_hash,))
+    exists = cur.fetchone() is not None
+    conn.close()
+    return exists
+
+
+def mark_ton_invoice_paid(order_id: int, tx_hash: str, amount_ton: float) -> None:
+    ensure_ton_tables()
+    invoice = get_ton_invoice_by_order(order_id)
+    if not invoice:
+        return
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE ton_invoices SET status='paid', tx_hash=?, paid_at=? WHERE order_id=?",
+        (tx_hash, now(), order_id),
+    )
+    cur.execute(
+        "INSERT OR IGNORE INTO ton_used_transactions (tx_hash, order_id, user_id, amount_ton, created_at) VALUES (?, ?, ?, ?, ?)",
+        (tx_hash, order_id, int(invoice['user_id']), float(amount_ton), now()),
+    )
+    conn.commit()
+    conn.close()
