@@ -29,6 +29,10 @@ class AdminBroadcastFSM(StatesGroup):
     waiting_text = State()
 
 
+class AdminTicketFSM(StatesGroup):
+    waiting_reply = State()
+
+
 class AdminPromoFSM(StatesGroup):
     waiting_code = State()
     waiting_amount = State()
