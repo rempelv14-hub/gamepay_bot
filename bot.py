@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
+import tempfile
+from datetime import datetime, timedelta
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -11,12 +14,16 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import settings
 from database import (
     change_balance,
     create_order,
+    create_no_comment_report,
+    create_review,
+    create_refund_record,
+    get_refund_by_order,
     create_support_ticket,
     count_user_support_tickets,
     close_support_ticket,
@@ -27,25 +34,36 @@ from database import (
     list_active_support_tickets,
     answer_support_ticket,
     get_order,
+    export_table_to_csv,
+    expire_ton_invoice,
+    get_admin_stats_expanded,
     get_stats,
+    get_product_item,
+    get_product_price,
     get_user,
     get_user_orders,
     get_user_activity_stats,
     get_users,
     init_db,
+    is_product_enabled,
     list_orders,
+    list_product_items,
     mark_reward_paid,
     top_clients,
     create_ton_invoice,
     get_ton_invoice_by_order,
     list_pending_ton_invoices,
     mark_ton_invoice_paid,
+    set_product_price,
+    toggle_product_enabled,
     update_order_status,
     upsert_user,
 )
 from keyboards import (
     admin_order_kb,
     admin_panel_kb,
+    admin_product_kb,
+    admin_products_kb,
     calculator_choice_kb,
     calculator_result_kb,
     back_menu_kb,
@@ -55,6 +73,7 @@ from keyboards import (
     payment_choice_kb,
     premium_kb,
     profile_kb,
+    review_kb,
     pubg_packages_kb,
     stars_packages_kb,
     support_panel_kb,
@@ -66,9 +85,9 @@ from keyboards import (
     user_order_kb,
 )
 from products import CUSTOM_PRODUCTS, PREMIUM_PACKAGES, PUBG_PACKAGES, STARS_PACKAGES
-from states import AdminBroadcastFSM, AdminTicketFSM, AdminOrderFSM, CalculatorFSM, OrderFSM, PubgFSM, SupportFSM, TopUpFSM
+from states import AdminBroadcastFSM, AdminProductFSM, AdminTicketFSM, AdminOrderFSM, CalculatorFSM, NoCommentFSM, OrderFSM, PubgFSM, SupportFSM, TopUpFSM
 from texts import INFO_TEXT, MENU_TEXT
-from ton_payments import find_ton_payment, kzt_to_ton, ton_invoice_comment, ton_is_configured
+from ton_payments import find_ton_payment, get_ton_rate_kzt, kzt_to_ton, ton_invoice_comment, ton_is_configured
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger("shop_bot")
@@ -81,8 +100,58 @@ router = Router()
 # =========================
 
 
+def admin_role(user_id: int) -> str:
+    if user_id in settings.owner_ids:
+        return "owner"
+    if user_id in settings.manager_ids:
+        return "manager"
+    if user_id in settings.support_ids:
+        return "support"
+    if user_id in settings.admin_ids:
+        return "owner"
+    return "user"
+
+
 def is_admin(user_id: int) -> bool:
-    return settings.admin_id != 0 and user_id == settings.admin_id
+    return admin_role(user_id) != "user"
+
+
+def is_owner(user_id: int) -> bool:
+    return admin_role(user_id) == "owner"
+
+
+def can_manage_orders(user_id: int) -> bool:
+    return admin_role(user_id) in {"owner", "manager"}
+
+
+def can_manage_support(user_id: int) -> bool:
+    return admin_role(user_id) in {"owner", "manager", "support"}
+
+
+def can_manage_settings(user_id: int) -> bool:
+    return admin_role(user_id) == "owner"
+
+
+def admin_role_ru(user_id: int) -> str:
+    return {
+        "owner": "Владелец",
+        "manager": "Менеджер",
+        "support": "Поддержка",
+        "user": "Нет доступа",
+    }.get(admin_role(user_id), "Нет доступа")
+
+
+def admin_ids() -> tuple[int, ...]:
+    return settings.admin_ids
+
+
+async def notify_admins(bot: Bot, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
+    for admin_id in admin_ids():
+        try:
+            await bot.send_message(admin_id, text, reply_markup=reply_markup)
+            await asyncio.sleep(0.03)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Cannot notify admin %s: %s", admin_id, exc)
 
 
 def safe(text: Any) -> str:
@@ -97,6 +166,8 @@ def order_status_ru(status: str) -> str:
         "work": "в работе",
         "done": "выполнен",
         "cancelled": "отменён",
+        "expired": "счёт истёк",
+        "refund_balance": "возврат на баланс",
     }.get(status, status)
 
 
@@ -120,6 +191,13 @@ def estimate_package_price(packages: dict[str, float | int], amount: int) -> tup
     price = round((normalized[closest] / closest) * amount, 2)
     note = f"примерный расчёт по цене ближайшего пакета {closest}"
     return price, note
+
+
+def current_package_prices(kind: str, fallback: dict[str, float | int]) -> dict[str, float]:
+    rows = list_product_items(kind, include_disabled=False)
+    if rows:
+        return {str(row["code"]): float(row["price"] or 0) for row in rows}
+    return {str(k): float(v) for k, v in fallback.items()}
 
 
 def format_order_for_admin(order: dict[str, Any] | Any) -> str:
@@ -153,12 +231,10 @@ async def send_main_menu(message: Message) -> None:
 
 
 async def notify_admin_order(bot: Bot, order_id: int) -> None:
-    if settings.admin_id == 0:
-        return
     order = get_order(order_id)
     if not order:
         return
-    await bot.send_message(settings.admin_id, format_order_for_admin(order), reply_markup=admin_order_kb(order_id))
+    await notify_admins(bot, format_order_for_admin(order), reply_markup=admin_order_kb(order_id))
 
 
 async def finish_order_from_state(callback: CallbackQuery, state: FSMContext, payment_method: str) -> None:
@@ -266,12 +342,21 @@ async def start_handler(message: Message, command: CommandObject) -> None:
         except ValueError:
             ref_by = None
 
-    upsert_user(
+    was_new = upsert_user(
         user_id=message.from_user.id,
         username=message.from_user.username,
         full_name=message.from_user.full_name,
         ref_by=ref_by,
     )
+    if was_new:
+        await notify_admins(
+            message.bot,
+            "👤 <b>Новый пользователь</b>\n\n"
+            f"Username: @{safe(message.from_user.username) if message.from_user.username else 'не указан'}\n"
+            f"Имя: {safe(message.from_user.full_name)}\n"
+            f"ID: <code>{message.from_user.id}</code>\n"
+            f"Дата: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>",
+        )
     await message.answer("Добро пожаловать 👋", reply_markup=bottom_menu_kb())
     await send_main_menu(message)
 
@@ -290,6 +375,24 @@ async def menu_handler(message: Message, state: FSMContext) -> None:
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
     await state.clear()
     await send_main_menu(message)
+
+
+@router.message(F.text == "📦 Мои заказы")
+async def my_orders_text_handler(message: Message) -> None:
+    orders = get_user_orders(message.from_user.id, limit=10)
+    if not orders:
+        await message.answer("У вас пока нет заказов.", reply_markup=back_menu_kb())
+        return
+    await message.answer(
+        "<b>📦 Мои заказы</b>\n\nНажмите на заказ, чтобы посмотреть детали и статус.",
+        reply_markup=user_orders_kb(orders),
+    )
+
+
+@router.message(F.text == "📞 Поддержка")
+async def support_text_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(support_panel_text(message.from_user.id), reply_markup=support_panel_kb())
 
 
 @router.message(Command("cancel"))
@@ -432,13 +535,17 @@ async def premium_handler(callback: CallbackQuery) -> None:
 async def fixed_product_handler(callback: CallbackQuery, state: FSMContext) -> None:
     _, kind, code = callback.data.split(":", 2)
 
+    if not is_product_enabled(f"{kind}:{code}"):
+        await callback.answer("Товар временно недоступен", show_alert=True)
+        return
+
     if kind == "stars":
-        price = STARS_PACKAGES[code]
+        price = get_product_price("stars", code, STARS_PACKAGES[code])
         product = f"Telegram Stars — {code} Stars"
         prompt = "Введите @username получателя или ссылку на профиль Telegram."
         category = "Telegram Stars"
     elif kind == "premium":
-        price = PREMIUM_PACKAGES[code]
+        price = get_product_price("premium", code, PREMIUM_PACKAGES[code])
         product = f"Telegram Premium — {code} мес."
         prompt = "Введите @username получателя Telegram Premium."
         category = "Telegram Premium"
@@ -460,6 +567,9 @@ async def fixed_product_handler(callback: CallbackQuery, state: FSMContext) -> N
 @router.callback_query(F.data.startswith("custom:"))
 async def custom_product_handler(callback: CallbackQuery, state: FSMContext) -> None:
     key = callback.data.split(":", 1)[1]
+    if not is_product_enabled(f"custom:{key}"):
+        await callback.answer("Раздел временно недоступен", show_alert=True)
+        return
     item = CUSTOM_PRODUCTS.get(key)
     if not item:
         await callback.answer("Раздел не найден", show_alert=True)
@@ -575,7 +685,10 @@ async def pubg_package_handler(callback: CallbackQuery, state: FSMContext) -> No
         await callback.answer()
         return
     uc = callback.data.split(":", 1)[1]
-    price = PUBG_PACKAGES[uc]
+    if not is_product_enabled(f"pubg:{uc}"):
+        await callback.answer("Этот пакет временно недоступен", show_alert=True)
+        return
+    price = get_product_price("pubg", uc, PUBG_PACKAGES[uc])
     await state.set_state(OrderFSM.waiting_payment)
     await state.update_data(
         category="PUBG UC",
@@ -750,9 +863,9 @@ async def support_message_handler(message: Message, state: FSMContext) -> None:
     ticket_id = create_support_ticket(message.from_user.id, message.from_user.username, text)
     ticket = get_support_ticket(ticket_id)
 
-    if settings.admin_id and ticket:
-        await message.bot.send_message(
-            settings.admin_id,
+    if ticket:
+        await notify_admins(
+            message.bot,
             ticket_admin_notice(ticket_id, ticket, text, is_reply=False),
             reply_markup=admin_ticket_kb(ticket_id),
         )
@@ -850,12 +963,11 @@ async def support_ticket_reply_text_handler(message: Message, state: FSMContext)
         await message.answer("❌ Тикет не найден или уже закрыт.")
         return
 
-    if settings.admin_id:
-        await message.bot.send_message(
-            settings.admin_id,
-            ticket_admin_notice(ticket_id, ticket, text, is_reply=True),
-            reply_markup=admin_ticket_kb(ticket_id),
-        )
+    await notify_admins(
+        message.bot,
+        ticket_admin_notice(ticket_id, ticket, text, is_reply=True),
+        reply_markup=admin_ticket_kb(ticket_id),
+    )
 
     await message.answer(
         f"✅ Сообщение добавлено в тикет <b>#{ticket_id}</b>.\n"
@@ -877,12 +989,11 @@ async def support_ticket_close_handler(callback: CallbackQuery) -> None:
         await callback.answer("Не удалось закрыть тикет", show_alert=True)
         return
 
-    if settings.admin_id:
-        await callback.bot.send_message(
-            settings.admin_id,
-            f"✅ Клиент закрыл тикет поддержки <b>#{ticket_id}</b>.\n"
-            f"Клиент: {user_mention(ticket['username'], int(ticket['user_id']))}"
-        )
+    await notify_admins(
+        callback.bot,
+        f"✅ Клиент закрыл тикет поддержки <b>#{ticket_id}</b>.\n"
+        f"Клиент: {user_mention(ticket['username'], int(ticket['user_id']))}"
+    )
 
     await callback.message.answer(
         f"✅ Тикет <b>#{ticket_id}</b> закрыт.",
@@ -893,7 +1004,7 @@ async def support_ticket_close_handler(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("admin_ticket_history:"))
 async def admin_ticket_history_handler(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
+    if not can_manage_support(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
@@ -912,7 +1023,7 @@ async def admin_ticket_history_handler(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("admin_ticket_reply:"))
 async def admin_ticket_reply_button_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
+    if not can_manage_support(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
@@ -938,7 +1049,7 @@ async def admin_ticket_reply_button_handler(callback: CallbackQuery, state: FSMC
 
 @router.message(AdminTicketFSM.waiting_reply)
 async def admin_ticket_reply_text_handler(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+    if not can_manage_support(message.from_user.id):
         return
 
     reply_text = (message.text or message.caption or "").strip()
@@ -978,7 +1089,7 @@ async def admin_ticket_reply_text_handler(message: Message, state: FSMContext) -
 
 @router.message(Command("ticket_reply"))
 async def admin_ticket_reply_command_handler(message: Message) -> None:
-    if not is_admin(message.from_user.id):
+    if not can_manage_support(message.from_user.id):
         await message.answer("Нет доступа.")
         return
 
@@ -1018,7 +1129,7 @@ async def admin_ticket_reply_command_handler(message: Message) -> None:
 
 @router.callback_query(F.data.startswith("admin_ticket_close:"))
 async def admin_ticket_close_handler(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
+    if not can_manage_support(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
@@ -1043,13 +1154,13 @@ async def admin_ticket_close_handler(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "admin_tickets")
 async def admin_tickets_handler(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
+    if not can_manage_support(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
     tickets = list_active_support_tickets(limit=10)
     if not tickets:
-        await callback.message.answer("Активных тикетов нет.", reply_markup=admin_panel_kb())
+        await callback.message.answer("Активных тикетов нет.", reply_markup=admin_panel_kb(admin_role(callback.from_user.id)))
         await callback.answer()
         return
 
@@ -1079,9 +1190,12 @@ async def calculator_handler(callback: CallbackQuery, state: FSMContext) -> None
     lines = ["<b>🧮 Калькулятор цены</b>\n"]
     lines.append("Выберите, что хотите посчитать. Бот сам рассчитает сумму по текущему прайсу.\n")
     lines.append("<b>Готовые цены:</b>")
-    lines.append("Stars: " + ", ".join([f"{amount} — {money(price)}" for amount, price in STARS_PACKAGES.items()]))
-    lines.append("Premium: " + ", ".join([f"{months} мес. — {money(price)}" for months, price in PREMIUM_PACKAGES.items()]))
-    lines.append("PUBG UC: " + ", ".join([f"{uc} — {money(price)}" for uc, price in PUBG_PACKAGES.items()]))
+    stars_prices = current_package_prices("stars", STARS_PACKAGES)
+    premium_prices = current_package_prices("premium", PREMIUM_PACKAGES)
+    pubg_prices = current_package_prices("pubg", PUBG_PACKAGES)
+    lines.append("Stars: " + ", ".join([f"{amount} — {money(price)}" for amount, price in stars_prices.items()]))
+    lines.append("Premium: " + ", ".join([f"{months} мес. — {money(price)}" for months, price in premium_prices.items()]))
+    lines.append("PUBG UC: " + ", ".join([f"{uc} — {money(price)}" for uc, price in pubg_prices.items()]))
     await callback.message.answer("\n".join(lines), reply_markup=calculator_choice_kb())
     await callback.answer()
 
@@ -1114,13 +1228,13 @@ async def calculator_amount_handler(message: Message, state: FSMContext) -> None
     data = await state.get_data()
     kind = data.get("calc_kind", "stars")
     if kind == "stars":
-        price, note = estimate_package_price(STARS_PACKAGES, amount)
+        price, note = estimate_package_price(current_package_prices("stars", STARS_PACKAGES), amount)
         title = f"⭐ {amount} Stars"
     elif kind == "uc":
-        price, note = estimate_package_price(PUBG_PACKAGES, amount)
+        price, note = estimate_package_price(current_package_prices("pubg", PUBG_PACKAGES), amount)
         title = f"🎮 {amount} UC"
     else:
-        price, note = estimate_package_price(PREMIUM_PACKAGES, amount)
+        price, note = estimate_package_price(current_package_prices("premium", PREMIUM_PACKAGES), amount)
         title = f"👑 Premium на {amount} мес."
     await state.clear()
     await message.answer(
@@ -1134,6 +1248,25 @@ async def calculator_amount_handler(message: Message, state: FSMContext) -> None
 @router.callback_query(F.data == "info")
 async def info_handler(callback: CallbackQuery) -> None:
     await callback.message.answer(INFO_TEXT, reply_markup=back_menu_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "faq")
+async def faq_handler(callback: CallbackQuery) -> None:
+    await callback.message.answer(
+        "<b>❓ Частые вопросы</b>\n\n"
+        "<b>Как оплатить через TON?</b>\n"
+        "Бот покажет адрес, точную сумму и комментарий. Комментарий обязателен.\n\n"
+        "<b>Что делать, если оплатил без комментария?</b>\n"
+        "Откройте заказ и нажмите кнопку <b>⚠️ Оплатил без комментария</b>.\n\n"
+        "<b>Сколько ждать заказ?</b>\n"
+        "После автоматической проверки оплаты заказ переходит в обработку. Время зависит от товара.\n\n"
+        "<b>Где посмотреть статус?</b>\n"
+        "Откройте <b>👤 Профиль → 📦 Мои заказы</b>.\n\n"
+        "<b>Как написать поддержку?</b>\n"
+        "Откройте <b>📞 Поддержка</b>, создайте тикет и опишите вопрос.",
+        reply_markup=back_menu_kb(),
+    )
     await callback.answer()
 
 
@@ -1159,38 +1292,208 @@ async def partner_handler(callback: CallbackQuery) -> None:
 
 @router.message(Command("admin"))
 async def admin_handler(message: Message) -> None:
-    if not is_admin(message.from_user.id):
+    if not can_manage_support(message.from_user.id):
         await message.answer("Нет доступа.")
         return
-    await message.answer("<b>🛠 Админ-панель</b>", reply_markup=admin_panel_kb())
+    role = admin_role(message.from_user.id)
+    await message.answer(
+        f"<b>🛠 Админ-панель</b>\nРоль: <b>{admin_role_ru(message.from_user.id)}</b>",
+        reply_markup=admin_panel_kb(role),
+    )
+
+
+@router.message(Command("ton_rate"))
+async def admin_ton_rate_handler(message: Message) -> None:
+    if not can_manage_orders(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+
+    rate = await asyncio.to_thread(get_ton_rate_kzt, True)
+    mode = "автоматический" if settings.ton_rate_auto_enabled else "ручной"
+    await message.answer(
+        f"📈 <b>Курс TON</b>\n\n"
+        f"Режим: <b>{mode}</b>\n"
+        f"1 TON ≈ <b>{money(rate)}</b>\n\n"
+        f"Fallback в Railway: <code>TON_RATE_KZT={settings.ton_rate_kzt:g}</code>"
+    )
 
 
 @router.callback_query(F.data == "admin_stats")
 async def admin_stats_handler(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
+    if not can_manage_orders(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    stats = get_stats()
+    stats = get_admin_stats_expanded()
     await callback.message.answer(
-        "<b>📊 Статистика</b>\n\n"
-        f"Пользователей: <b>{stats['users_count']}</b>\n"
-        f"Всего заказов: <b>{stats['orders_count']}</b>\n"
-        f"Активных заказов: <b>{stats['active_orders']}</b>\n"
-        f"Открытых вопросов: <b>{stats['open_tickets']}</b>\n"
-        f"Сумма выполненных заказов: <b>{money(float(stats['done_sum']))}</b>",
-        reply_markup=admin_panel_kb(),
+        "<b>📊 Статистика GamePay</b>\n\n"
+        f"👥 Пользователей: <b>{stats['users_count']}</b>\n"
+        f"👤 Новых сегодня: <b>{stats['new_users_today']}</b>\n\n"
+        f"📦 Заказов всего: <b>{stats['orders_count']}</b>\n"
+        f"📦 Заказов сегодня: <b>{stats['orders_today']}</b>\n"
+        f"⏳ Ожидают TON: <b>{stats['waiting_ton']}</b>\n"
+        f"🛠 Активных заказов: <b>{stats['active_orders']}</b>\n"
+        f"✅ Выполненных: <b>{stats['done_orders']}</b>\n"
+        f"❌ Отменённых: <b>{stats['cancelled_orders']}</b>\n\n"
+        f"💰 Оплачено сегодня: <b>{money(float(stats['paid_today']))}</b>\n"
+        f"💰 Оплачено за месяц: <b>{money(float(stats['paid_month']))}</b>\n\n"
+        f"🆘 Активных тикетов: <b>{stats['open_tickets']}</b>\n"
+        f"⭐ Отзывов: <b>{stats['reviews_count']}</b>\n"
+        f"⭐ Средняя оценка: <b>{stats['avg_rating']:.2f}</b>",
+        reply_markup=admin_panel_kb(admin_role(callback.from_user.id)),
     )
     await callback.answer()
 
 
+@router.callback_query(F.data == "admin_products")
+async def admin_products_handler(callback: CallbackQuery) -> None:
+    if not can_manage_settings(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    items = list_product_items(include_disabled=True)
+    await callback.message.answer(
+        "<b>⚙️ Товары и цены</b>\n\n"
+        "Нажмите на товар, чтобы изменить цену или включить/выключить его.",
+        reply_markup=admin_products_kb(items),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_product:"))
+async def admin_product_view_handler(callback: CallbackQuery) -> None:
+    if not can_manage_settings(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    sku = callback.data.split(":", 1)[1]
+    item = get_product_item(sku)
+    if not item:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+    status = "✅ включён" if int(item["enabled"] or 0) == 1 else "⛔ выключен"
+    price = float(item["price"] or 0)
+    await callback.message.answer(
+        f"<b>⚙️ {safe(item['title'])}</b>\n\n"
+        f"SKU: <code>{safe(item['sku'])}</code>\n"
+        f"Тип: <b>{safe(item['kind'])}</b>\n"
+        f"Цена: <b>{money(price) if price > 0 else 'договорная'}</b>\n"
+        f"Статус: <b>{status}</b>",
+        reply_markup=admin_product_kb(sku),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_product_price:"))
+async def admin_product_price_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    if not can_manage_settings(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    sku = callback.data.split(":", 1)[1]
+    item = get_product_item(sku)
+    if not item:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+    await state.set_state(AdminProductFSM.waiting_price)
+    await state.update_data(sku=sku)
+    await callback.message.answer(
+        f"Введите новую цену для <b>{safe(item['title'])}</b> в тенге.\n\n"
+        "Пример: <code>1500</code>\n"
+        "Для товаров по договорённости можно поставить <code>0</code>.",
+        reply_markup=back_menu_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminProductFSM.waiting_price)
+async def admin_product_price_text_handler(message: Message, state: FSMContext) -> None:
+    if not can_manage_settings(message.from_user.id):
+        return
+    raw = (message.text or "").replace(" ", "").replace(",", ".")
+    try:
+        price = float(raw)
+    except ValueError:
+        await message.answer("Введите цену цифрами. Например: 1500")
+        return
+    if price < 0:
+        await message.answer("Цена не может быть отрицательной.")
+        return
+    data = await state.get_data()
+    sku = str(data.get("sku", ""))
+    ok = set_product_price(sku, price)
+    await state.clear()
+    if not ok:
+        await message.answer("❌ Товар не найден.", reply_markup=admin_panel_kb(admin_role(message.from_user.id)))
+        return
+    item = get_product_item(sku)
+    await message.answer(
+        f"✅ Цена обновлена.\n\n"
+        f"Товар: <b>{safe(item['title']) if item else safe(sku)}</b>\n"
+        f"Новая цена: <b>{money(price) if price > 0 else 'договорная'}</b>",
+        reply_markup=admin_product_kb(sku),
+    )
+
+
+@router.callback_query(F.data.startswith("admin_product_toggle:"))
+async def admin_product_toggle_handler(callback: CallbackQuery) -> None:
+    if not can_manage_settings(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    sku = callback.data.split(":", 1)[1]
+    new_status = toggle_product_enabled(sku)
+    if new_status is None:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+    await callback.answer("Товар включён" if new_status else "Товар выключен", show_alert=True)
+    item = get_product_item(sku)
+    if item:
+        status = "✅ включён" if new_status else "⛔ выключен"
+        await callback.message.answer(
+            f"<b>{safe(item['title'])}</b> теперь: <b>{status}</b>",
+            reply_markup=admin_product_kb(sku),
+        )
+
+
+@router.callback_query(F.data == "admin_export")
+async def admin_export_handler(callback: CallbackQuery) -> None:
+    if not can_manage_settings(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer("Готовлю отчёты...")
+    export_dir = tempfile.mkdtemp(prefix="gamepay_export_")
+    files = []
+    for table in ["users", "orders", "transactions", "refunds", "support_tickets", "ton_invoices", "reviews", "no_comment_reports"]:
+        path = os.path.join(export_dir, f"{table}.csv")
+        try:
+            export_table_to_csv(table, path)
+            files.append(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Export %s failed: %s", table, exc)
+    for path in files:
+        await callback.message.answer_document(FSInputFile(path))
+    await callback.message.answer("✅ Экспорт готов.", reply_markup=admin_panel_kb(admin_role(callback.from_user.id)))
+
+
+@router.callback_query(F.data == "admin_backup")
+async def admin_backup_handler(callback: CallbackQuery) -> None:
+    if not can_manage_settings(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    if not os.path.exists(settings.db_path):
+        await callback.answer("Файл базы пока не найден", show_alert=True)
+        return
+    await callback.message.answer_document(
+        FSInputFile(settings.db_path, filename=f"gamepay_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db"),
+        caption="💾 Бэкап базы GamePay",
+    )
+    await callback.answer("Бэкап отправлен")
+
+
 @router.callback_query(F.data == "admin_orders")
 async def admin_orders_handler(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
+    if not can_manage_orders(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     orders = list_orders(limit=10)
     if not orders:
-        await callback.message.answer("Новых заказов нет.", reply_markup=admin_panel_kb())
+        await callback.message.answer("Новых заказов нет.", reply_markup=admin_panel_kb(admin_role(callback.from_user.id)))
         await callback.answer()
         return
     for order in orders:
@@ -1200,7 +1503,7 @@ async def admin_orders_handler(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("admin_work:"))
 async def admin_work_handler(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
+    if not can_manage_orders(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     order_id = int(callback.data.split(":", 1)[1])
@@ -1219,7 +1522,7 @@ async def admin_work_handler(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("admin_done:"))
 async def admin_done_handler(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
+    if not can_manage_orders(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     order_id = int(callback.data.split(":", 1)[1])
@@ -1251,7 +1554,7 @@ async def admin_done_handler(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("admin_cancel:"))
 async def admin_cancel_handler(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
+    if not can_manage_orders(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     order_id = int(callback.data.split(":", 1)[1])
@@ -1263,8 +1566,44 @@ async def admin_cancel_handler(callback: CallbackQuery) -> None:
         await callback.answer("Уже отменён", show_alert=True)
         return
 
-    if order["payment_method"] == "balance" and order["status"] != "done":
-        change_balance(int(order["user_id"]), float(order["price"] or 0), f"Возврат за отмену заказа #{order_id}", order_id)
+    refund_text = ""
+    if order["status"] == "done":
+        await callback.answer("Выполненный заказ нельзя отменить этой кнопкой.", show_alert=True)
+        return
+
+    if order["payment_method"] == "balance":
+        refund_amount = float(order["price"] or 0)
+        if refund_amount > 0 and not get_refund_by_order(order_id):
+            change_balance(int(order["user_id"]), refund_amount, f"Возврат за отмену заказа #{order_id}", order_id)
+            create_refund_record(
+                order_id=order_id,
+                user_id=int(order["user_id"]),
+                amount_kzt=refund_amount,
+                method="balance",
+                status="done",
+                note="Возврат оплаты с внутреннего баланса",
+            )
+            refund_text = f"\n\n↩️ Сумма <b>{money(refund_amount)}</b> возвращена на ваш баланс."
+
+    elif order["payment_method"] == "TON" and order["status"] in {"paid", "work"} and settings.refund_to_balance_enabled:
+        refund_amount = float(order["price"] or 0)
+        invoice = get_ton_invoice_by_order(order_id)
+        amount_ton = float(invoice["amount_ton"] or 0) if invoice else 0.0
+        if refund_amount > 0 and not get_refund_by_order(order_id):
+            change_balance(int(order["user_id"]), refund_amount, f"Возврат TON-оплаты за заказ #{order_id} на баланс", order_id)
+            create_refund_record(
+                order_id=order_id,
+                user_id=int(order["user_id"]),
+                amount_kzt=refund_amount,
+                amount_ton=amount_ton,
+                method="ton_to_balance",
+                status="done",
+                note="Безопасный автовозврат TON-оплаты на внутренний баланс",
+            )
+            refund_text = (
+                f"\n\n↩️ TON-оплата возвращена на внутренний баланс: <b>{money(refund_amount)}</b>."
+                "\nПрямой on-chain возврат TON не выполняется, чтобы не хранить seed/private key в боте."
+            )
 
     update_order_status(order_id, "cancelled")
     try:
@@ -1273,14 +1612,14 @@ async def admin_cancel_handler(callback: CallbackQuery) -> None:
         pass
     await callback.bot.send_message(
         int(order["user_id"]),
-        f"❌ Ваш заказ <b>#{order_id}</b> отменён.\n\nЕсли нужна помощь — напишите в поддержку.",
+        f"❌ Ваш заказ <b>#{order_id}</b> отменён.{refund_text}\n\nЕсли нужна помощь — напишите в поддержку.",
     )
     await callback.answer("Заказ отменён")
 
 
 @router.callback_query(F.data.startswith("admin_order_msg:"))
 async def admin_order_message_button_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
+    if not can_manage_orders(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     order_id = int(callback.data.split(":", 1)[1])
@@ -1300,7 +1639,7 @@ async def admin_order_message_button_handler(callback: CallbackQuery, state: FSM
 
 @router.message(AdminOrderFSM.waiting_message)
 async def admin_order_message_text_handler(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+    if not can_manage_orders(message.from_user.id):
         return
 
     data = await state.get_data()
@@ -1310,7 +1649,7 @@ async def admin_order_message_text_handler(message: Message, state: FSMContext) 
 
     if not order:
         await state.clear()
-        await message.answer("❌ Заказ не найден.", reply_markup=admin_panel_kb())
+        await message.answer("❌ Заказ не найден.", reply_markup=admin_panel_kb(admin_role(message.from_user.id)))
         return
     if len(text_to_send) < 2:
         await message.answer("Сообщение слишком короткое. Напишите текст для клиента.")
@@ -1336,7 +1675,7 @@ async def admin_order_message_text_handler(message: Message, state: FSMContext) 
 
 @router.message(Command("order_reply"))
 async def admin_order_reply_command_handler(message: Message) -> None:
-    if not is_admin(message.from_user.id):
+    if not can_manage_orders(message.from_user.id):
         await message.answer("Нет доступа.")
         return
 
@@ -1366,14 +1705,14 @@ async def admin_order_reply_command_handler(message: Message) -> None:
 
 @router.callback_query(F.data == "admin_create_promo")
 async def admin_create_promo_disabled_handler(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
+    if not can_manage_settings(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer("Промокоды отключены", show_alert=True)
 
 @router.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
+    if not can_manage_settings(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     await state.set_state(AdminBroadcastFSM.waiting_text)
@@ -1383,7 +1722,7 @@ async def admin_broadcast_handler(callback: CallbackQuery, state: FSMContext) ->
 
 @router.message(AdminBroadcastFSM.waiting_text)
 async def admin_broadcast_text_handler(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+    if not can_manage_settings(message.from_user.id):
         return
     text = message.html_text or message.text or ""
     users = get_users()
@@ -1398,12 +1737,12 @@ async def admin_broadcast_text_handler(message: Message, state: FSMContext) -> N
             failed += 1
             logger.warning("Broadcast failed for %s: %s", user["user_id"], exc)
     await state.clear()
-    await message.answer(f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}", reply_markup=admin_panel_kb())
+    await message.answer(f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}", reply_markup=admin_panel_kb(admin_role(message.from_user.id)))
 
 
 @router.message(Command("balance_add"))
 async def admin_balance_add_handler(message: Message) -> None:
-    if not is_admin(message.from_user.id):
+    if not can_manage_settings(message.from_user.id):
         await message.answer("Нет доступа.")
         return
     parts = (message.text or "").split(maxsplit=3)
@@ -1427,7 +1766,7 @@ async def admin_balance_add_handler(message: Message) -> None:
 
 @router.message(Command("reply"))
 async def admin_reply_handler(message: Message) -> None:
-    if not is_admin(message.from_user.id):
+    if not can_manage_support(message.from_user.id):
         await message.answer("Нет доступа.")
         return
     parts = (message.text or "").split(maxsplit=2)
@@ -1441,6 +1780,34 @@ async def admin_reply_handler(message: Message) -> None:
         return
     await message.bot.send_message(user_id, f"📞 Ответ поддержки:\n\n{safe(parts[2])}")
     await message.answer("✅ Ответ отправлен.")
+
+
+@router.callback_query(F.data.startswith("review:"))
+async def review_handler(callback: CallbackQuery) -> None:
+    _, order_id_raw, rating_raw = callback.data.split(":", 2)
+    order_id = int(order_id_raw)
+    rating = int(rating_raw)
+    order = get_order(order_id)
+    if not order or int(order["user_id"]) != callback.from_user.id:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    ok, msg = create_review(order_id, callback.from_user.id, rating)
+    await callback.message.answer(f"⭐ {safe(msg)}")
+    if ok:
+        await notify_admins(
+            callback.bot,
+            f"⭐ <b>Новый отзыв</b>\n\n"
+            f"Заказ: <b>#{order_id}</b>\n"
+            f"Клиент: {user_mention(order['username'], int(order['user_id']))}\n"
+            f"Оценка: <b>{rating}/5</b>",
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("review_skip:"))
+async def review_skip_handler(callback: CallbackQuery) -> None:
+    await callback.answer("Хорошо", show_alert=False)
+    await callback.message.answer("Оценку можно не оставлять. Спасибо за покупку!", reply_markup=back_menu_kb())
 
 
 # =========================
@@ -1495,9 +1862,11 @@ async def create_ton_payment_order(
         payment_method="TON",
         status="waiting_ton",
     )
+    current_rate = get_ton_rate_kzt()
     amount_ton = kzt_to_ton(price)
     comment = ton_invoice_comment(order_id, user_id)
-    create_ton_invoice(order_id, user_id, price, amount_ton, comment)
+    expires_at = (datetime.now() + timedelta(minutes=settings.ton_invoice_ttl_minutes)).strftime("%Y-%m-%d %H:%M:%S")
+    create_ton_invoice(order_id, user_id, price, amount_ton, comment, expires_at=expires_at)
 
     if state:
         await state.clear()
@@ -1506,13 +1875,69 @@ async def create_ton_payment_order(
         f"💎 <b>TON-оплата заказа #{order_id}</b>\n\n"
         f"📦 Товар: <b>{safe(product)}</b>\n"
         f"💵 Сумма: <b>{money(price)}</b>\n"
-        f"💎 К оплате: <b>{amount_ton:g} TON</b>\n\n"
+        f"💎 К оплате: <b>{amount_ton:g} TON</b>\n"
+        f"📈 Курс: <b>1 TON ≈ {money(current_rate)}</b>\n\n"
         f"Отправьте ровно или больше <b>{amount_ton:g} TON</b> на адрес:\n"
         f"<code>{safe(settings.ton_wallet)}</code>\n\n"
         f"Комментарий к платежу обязательно:\n"
         f"<code>{safe(comment)}</code>\n\n"
+        f"Счёт действует <b>{settings.ton_invoice_ttl_minutes}</b> минут, до <code>{expires_at}</code>.\n\n"
         "После оплаты нажмите кнопку проверки. Бот также сам периодически проверяет оплату.",
         reply_markup=ton_invoice_kb(order_id),
+    )
+
+
+@router.callback_query(F.data.startswith("ton_no_comment:"))
+async def ton_no_comment_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    order_id = int(callback.data.split(":", 1)[1])
+    order = get_order(order_id)
+    if not order or int(order["user_id"]) != callback.from_user.id:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    await state.set_state(NoCommentFSM.waiting_report)
+    await state.update_data(order_id=order_id)
+    await callback.message.answer(
+        "⚠️ <b>Оплата без комментария</b>\n\n"
+        "Напишите одним сообщением:\n"
+        "1) сумму TON;\n"
+        "2) примерное время оплаты;\n"
+        "3) последние 4 символа адреса отправителя или пришлите скрин.\n\n"
+        "Админ проверит вручную.",
+        reply_markup=back_menu_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(NoCommentFSM.waiting_report)
+async def no_comment_report_text_handler(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    order_id = int(data.get("order_id") or 0)
+    text = (message.text or message.caption or "").strip()
+    if len(text) < 3 and not message.photo:
+        await message.answer("Напишите детали оплаты или отправьте скрин.")
+        return
+    report_id = create_no_comment_report(order_id, message.from_user.id, message.from_user.username, text or "Скрин оплаты без комментария")
+    order = get_order(order_id)
+    notice = (
+        f"⚠️ <b>Оплата без комментария #{report_id}</b>\n\n"
+        f"Заказ: <b>#{order_id}</b>\n"
+        f"Клиент: {user_mention(message.from_user.username, message.from_user.id)}\n"
+        f"User ID: <code>{message.from_user.id}</code>\n\n"
+        f"Сообщение клиента:\n{safe(text or 'приложен скрин')}\n\n"
+        "Проверьте вручную в Tonkeeper / TON Center."
+    )
+    await notify_admins(message.bot, notice, reply_markup=admin_order_kb(order_id) if order else None)
+    if message.photo:
+        for admin_id in admin_ids():
+            try:
+                await message.forward(admin_id)
+            except Exception:
+                pass
+    await state.clear()
+    await message.answer(
+        "✅ Заявка на ручную проверку отправлена администратору.\n"
+        "Как только платёж проверят, вам ответят в боте.",
+        reply_markup=user_order_kb(order_id, str(order["status"])) if order else back_menu_kb(),
     )
 
 
@@ -1533,11 +1958,7 @@ async def process_ton_paid_order(bot: Bot, order_id: int, tx_hash: str, amount_t
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Cannot notify topup user %s: %s", order["user_id"], exc)
-        if settings.admin_id:
-            try:
-                await bot.send_message(settings.admin_id, f"💎 TON-пополнение #{order_id} оплачено автоматически.")
-            except Exception:
-                pass
+        await notify_admins(bot, f"💎 TON-пополнение #{order_id} оплачено автоматически.")
         return True
 
     update_order_status(order_id, "paid")
@@ -1552,9 +1973,9 @@ async def process_ton_paid_order(bot: Bot, order_id: int, tx_hash: str, amount_t
     except Exception as exc:  # noqa: BLE001
         logger.warning("Cannot notify user %s: %s", order["user_id"], exc)
 
-    if settings.admin_id and paid_order:
-        await bot.send_message(
-            settings.admin_id,
+    if paid_order:
+        await notify_admins(
+            bot,
             "💎 <b>Заказ оплачен через TON автоматически</b>\n\n" + format_order_for_admin(paid_order),
             reply_markup=admin_order_kb(order_id),
         )
@@ -1565,6 +1986,15 @@ async def check_ton_invoice(bot: Bot, order_id: int) -> bool:
     invoice = get_ton_invoice_by_order(order_id)
     if not invoice or invoice["status"] != "pending":
         return False
+    expires_at = invoice["expires_at"] if "expires_at" in invoice.keys() else None
+    if expires_at:
+        try:
+            if datetime.strptime(str(expires_at), "%Y-%m-%d %H:%M:%S") < datetime.now():
+                expire_ton_invoice(order_id)
+                update_order_status(order_id, "expired")
+                return False
+        except Exception:
+            pass
     tx = await asyncio.to_thread(find_ton_payment, invoice["comment"], float(invoice["amount_ton"]))
     if not tx:
         return False
@@ -1620,6 +2050,29 @@ async def ton_check_handler(callback: CallbackQuery) -> None:
         await callback.answer("Платёж пока не найден. Проверьте сумму и комментарий.", show_alert=True)
 
 
+async def auto_backup_task(bot: Bot) -> None:
+    while True:
+        try:
+            now_dt = datetime.now()
+            target = now_dt.replace(hour=settings.auto_backup_hour, minute=0, second=0, microsecond=0)
+            if target <= now_dt:
+                target += timedelta(days=1)
+            await asyncio.sleep((target - now_dt).total_seconds())
+            if os.path.exists(settings.db_path):
+                for admin_id in admin_ids():
+                    try:
+                        await bot.send_document(
+                            admin_id,
+                            FSInputFile(settings.db_path, filename=f"gamepay_auto_backup_{datetime.now().strftime('%Y%m%d')}.db"),
+                            caption="💾 Автобэкап базы GamePay",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Auto backup failed for %s: %s", admin_id, exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Auto backup task error: %s", exc)
+            await asyncio.sleep(3600)
+
+
 async def main() -> None:
     if not settings.bot_token:
         raise RuntimeError("Не указан BOT_TOKEN в .env")
@@ -1633,6 +2086,10 @@ async def main() -> None:
         logger.info("TON auto checker started")
     else:
         logger.warning("TON auto payments are not configured")
+
+    if settings.auto_backup_enabled:
+        asyncio.create_task(auto_backup_task(bot))
+        logger.info("Auto backup task started")
 
     logger.info("Bot started")
     await dp.start_polling(bot)
