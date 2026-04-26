@@ -58,14 +58,26 @@ def support_panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📝 Создать тикет", callback_data="support_create")],
+            [InlineKeyboardButton(text="📋 Мои тикеты", callback_data="support_my_tickets")],
             [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_menu")],
         ]
     )
 
 
+def user_ticket_kb(ticket_id: int, is_closed: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    if not is_closed:
+        rows.append([InlineKeyboardButton(text="✍️ Ответить в тикет", callback_data=f"support_ticket_reply:{ticket_id}")])
+        rows.append([InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"support_ticket_close:{ticket_id}")])
+    rows.append([InlineKeyboardButton(text="📋 Мои тикеты", callback_data="support_my_tickets")])
+    rows.append([InlineKeyboardButton(text="⬅️ В поддержку", callback_data="support")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def admin_ticket_kb(ticket_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="📜 История тикета", callback_data=f"admin_ticket_history:{ticket_id}")],
             [InlineKeyboardButton(text="✉️ Ответить на тикет", callback_data=f"admin_ticket_reply:{ticket_id}")],
             [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"admin_ticket_close:{ticket_id}")],
         ]
@@ -148,6 +160,41 @@ def profile_kb() -> InlineKeyboardMarkup:
     )
 
 
+def user_orders_kb(orders) -> InlineKeyboardMarkup:
+    rows = []
+    for order in orders:
+        status_icons = {
+            "new": "🧾",
+            "waiting_ton": "💎",
+            "paid": "💰",
+            "work": "🟡",
+            "done": "✅",
+            "cancelled": "❌",
+        }
+        icon = status_icons.get(order["status"], "📦")
+        title = str(order["product"])
+        if len(title) > 26:
+            title = title[:23] + "..."
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{icon} #{order['id']} — {title}",
+                callback_data=f"user_order:{order['id']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="profile")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def user_order_kb(order_id: int, status: str) -> InlineKeyboardMarkup:
+    rows = []
+    if status == "waiting_ton":
+        rows.append([InlineKeyboardButton(text="🔎 Проверить TON оплату", callback_data=f"ton_check:{order_id}")])
+    rows.append([InlineKeyboardButton(text="📦 Мои заказы", callback_data="my_orders")])
+    rows.append([InlineKeyboardButton(text="📞 Поддержка", callback_data="support")])
+    rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="back_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def admin_order_kb(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -155,6 +202,7 @@ def admin_order_kb(order_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🟡 В работу", callback_data=f"admin_work:{order_id}"),
                 InlineKeyboardButton(text="✅ Выполнено", callback_data=f"admin_done:{order_id}"),
             ],
+            [InlineKeyboardButton(text="✉️ Написать клиенту", callback_data=f"admin_order_msg:{order_id}")],
             [InlineKeyboardButton(text="❌ Отменить", callback_data=f"admin_cancel:{order_id}")],
         ]
     )
@@ -167,7 +215,10 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📦 Новые заказы", callback_data="admin_orders"),
                 InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"),
             ],
-            [InlineKeyboardButton(text="📣 Рассылка", callback_data="admin_broadcast")],
+            [
+                InlineKeyboardButton(text="🆘 Активные тикеты", callback_data="admin_tickets"),
+                InlineKeyboardButton(text="📣 Рассылка", callback_data="admin_broadcast"),
+            ],
             [InlineKeyboardButton(text="⬅️ Меню клиента", callback_data="back_menu")],
         ]
     )
