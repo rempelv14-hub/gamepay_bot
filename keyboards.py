@@ -3,16 +3,22 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 from config import settings
+from currency_utils import format_money, format_money_multi, normalize_currency
 from products import CUSTOM_PRODUCTS, PREMIUM_PACKAGES, PUBG_PACKAGES, STARS_PACKAGES, TOP_UP_AMOUNTS
 
 
-def money(value: float | int) -> str:
+def money(value: float | int, currency: str | None = None) -> str:
     try:
-        if float(value).is_integer():
-            return f"{int(value)}{settings.currency_symbol}"
-        return f"{float(value):.2f}{settings.currency_symbol}"
+        return format_money(float(value), currency or settings.default_currency)
     except Exception:
         return f"{value}{settings.currency_symbol}"
+
+
+def money_multi(value: float | int) -> str:
+    try:
+        return format_money_multi(float(value))
+    except Exception:
+        return money(value)
 
 
 def _items(kind: str, fallback: dict[str, float | int]):
@@ -81,9 +87,10 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📞 Поддержка", callback_data="support"),
         ],
         [
+            InlineKeyboardButton(text="🌍 Валюта", callback_data="currency"),
             InlineKeyboardButton(text="🧮 Калькулятор", callback_data="calculator"),
-            InlineKeyboardButton(text="❓ FAQ", callback_data="faq"),
         ],
+        [InlineKeyboardButton(text="❓ FAQ", callback_data="faq")],
         [InlineKeyboardButton(text="ℹ️ Информация", callback_data="info")],
         [InlineKeyboardButton(text="🏆 Топ клиентов", callback_data="top_clients")],
         [InlineKeyboardButton(text="🤝 Стать партнёром", callback_data="partner")],
@@ -131,7 +138,7 @@ def stars_packages_kb() -> InlineKeyboardMarkup:
     for i in range(0, len(items), 2):
         row = []
         for amount, price, _title in items[i:i + 2]:
-            row.append(InlineKeyboardButton(text=f"⭐ {amount} Stars — {money(price)}", callback_data=f"fixed:stars:{amount}"))
+            row.append(InlineKeyboardButton(text=f"⭐ {amount} Stars — {money_multi(price)}", callback_data=f"fixed:stars:{amount}"))
         rows.append(row)
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -143,7 +150,7 @@ def premium_kb() -> InlineKeyboardMarkup:
     for i in range(0, len(items), 2):
         row = []
         for months, price, _title in items[i:i + 2]:
-            row.append(InlineKeyboardButton(text=f"👑 {months} мес. — {money(price)}", callback_data=f"fixed:premium:{months}"))
+            row.append(InlineKeyboardButton(text=f"👑 {months} мес. — {money_multi(price)}", callback_data=f"fixed:premium:{months}"))
         rows.append(row)
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -155,7 +162,7 @@ def pubg_packages_kb() -> InlineKeyboardMarkup:
     for i in range(0, len(items), 2):
         row = []
         for uc, price, _title in items[i:i + 2]:
-            row.append(InlineKeyboardButton(text=f"🎮 {uc} UC — {money(price)}", callback_data=f"pubg_pack:{uc}"))
+            row.append(InlineKeyboardButton(text=f"🎮 {uc} UC — {money_multi(price)}", callback_data=f"pubg_pack:{uc}"))
         rows.append(row)
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -167,7 +174,7 @@ def top_up_kb() -> InlineKeyboardMarkup:
     amounts = [(code, price) for code, price, _title in items]
     for i in range(0, len(amounts), 2):
         rows.append([
-            InlineKeyboardButton(text=money(price), callback_data=f"topup_amount:{price:g}")
+            InlineKeyboardButton(text=money_multi(price), callback_data=f"topup_amount:{price:g}")
             for code, price in amounts[i:i + 2]
         ])
     rows.append([InlineKeyboardButton(text="✍️ Другая сумма", callback_data="topup_custom")])
@@ -180,9 +187,30 @@ def payment_choice_kb(price: float) -> InlineKeyboardMarkup:
     if price > 0:
         buttons.append([InlineKeyboardButton(text="💎 Оплатить TON автоматически", callback_data="pay:ton")])
         buttons.append([InlineKeyboardButton(text="💰 Оплатить с баланса", callback_data="pay:balance")])
-    buttons.append([InlineKeyboardButton(text="🧾 Создать заявку / оплата вручную", callback_data="pay:manual")])
+        buttons.append([
+            InlineKeyboardButton(text="🇰🇿 Ручная оплата ₸", callback_data="pay:manual_kzt"),
+            InlineKeyboardButton(text="🇷🇺 Ручная оплата ₽", callback_data="pay:manual_rub"),
+        ])
+    else:
+        buttons.append([InlineKeyboardButton(text="🇰🇿 Заявка / оплата ₸", callback_data="pay:manual_kzt")])
+        buttons.append([InlineKeyboardButton(text="🇷🇺 Заявка / оплата ₽", callback_data="pay:manual_rub")])
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def currency_choice_kb(current: str | None = None) -> InlineKeyboardMarkup:
+    current = normalize_currency(current)
+    kzt = "✅ ₸ Тенге" if current == "KZT" else "₸ Тенге"
+    rub = "✅ ₽ Рубли" if current == "RUB" else "₽ Рубли"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=kzt, callback_data="set_currency:KZT"),
+                InlineKeyboardButton(text=rub, callback_data="set_currency:RUB"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")],
+        ]
+    )
 
 
 def ton_invoice_kb(order_id: int) -> InlineKeyboardMarkup:
@@ -286,7 +314,7 @@ def admin_products_kb(items) -> InlineKeyboardMarkup:
     for item in items:
         icon = "✅" if int(item["enabled"] or 0) == 1 else "⛔"
         price = float(item["price"] or 0)
-        price_text = money(price) if price > 0 else "договорная"
+        price_text = money_multi(price) if price > 0 else "договорная"
         title = str(item["title"])
         if len(title) > 25:
             title = title[:22] + "..."
