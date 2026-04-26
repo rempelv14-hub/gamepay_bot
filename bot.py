@@ -22,6 +22,8 @@ from database import (
     create_support_ticket,
     count_user_support_tickets,
     close_support_ticket,
+    get_support_ticket,
+    answer_support_ticket,
     get_order,
     get_stats,
     get_user,
@@ -59,7 +61,7 @@ from keyboards import (
     ton_invoice_kb,
 )
 from products import CUSTOM_PRODUCTS, PREMIUM_PACKAGES, PUBG_PACKAGES, STARS_PACKAGES
-from states import AdminBroadcastFSM, AdminPromoFSM, CalculatorFSM, OrderFSM, PromoFSM, PubgFSM, SupportFSM, TopUpFSM
+from states import AdminBroadcastFSM, AdminPromoFSM, AdminTicketFSM, CalculatorFSM, OrderFSM, PromoFSM, PubgFSM, SupportFSM, TopUpFSM
 from texts import INFO_TEXT, MENU_TEXT
 from ton_payments import find_ton_payment, kzt_to_ton, ton_invoice_comment, ton_is_configured
 
@@ -685,7 +687,7 @@ async def support_message_handler(message: Message, state: FSMContext) -> None:
             f"🆔 User ID: <code>{message.from_user.id}</code>\n"
             f"🔗 Username: @{safe(message.from_user.username) if message.from_user.username else 'не указан'}\n\n"
             f"<b>Жалоба / вопрос:</b>\n{safe(text)}\n\n"
-            f"Ответить клиенту:\n<code>/reply {message.from_user.id} ваш текст</code>",
+            f"Ответить можно кнопкой ниже или командой:\n<code>/ticket_reply {ticket_id} ваш текст</code>",
             reply_markup=admin_ticket_kb(ticket_id),
         )
 
@@ -697,6 +699,104 @@ async def support_message_handler(message: Message, state: FSMContext) -> None:
     )
 
 
+@router.callback_query(F.data.startswith("admin_ticket_reply:"))
+async def admin_ticket_reply_button_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    ticket_id = int(callback.data.split(":", 1)[1])
+    ticket = get_support_ticket(ticket_id)
+    if not ticket:
+        await callback.answer("Тикет не найден", show_alert=True)
+        return
+
+    await state.set_state(AdminTicketFSM.waiting_reply)
+    await state.update_data(ticket_id=ticket_id)
+    await callback.message.answer(
+        f"✉️ Введите ответ на тикет <b>#{ticket_id}</b> одним сообщением.\n\n"
+        f"Клиент: {user_mention(ticket['username'], int(ticket['user_id']))}\n"
+        f"Вопрос: {safe(ticket['message'])}\n\n"
+        "Для отмены используйте /cancel"
+    )
+    await callback.answer()
+
+
+@router.message(AdminTicketFSM.waiting_reply)
+async def admin_ticket_reply_text_handler(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+
+    reply_text = (message.text or message.caption or "").strip()
+    if len(reply_text) < 2:
+        await message.answer("Ответ слишком короткий. Напишите ответ одним сообщением или /cancel.")
+        return
+
+    data = await state.get_data()
+    ticket_id = int(data.get("ticket_id", 0))
+    ticket = answer_support_ticket(ticket_id, reply_text)
+    await state.clear()
+
+    if not ticket:
+        await message.answer("❌ Тикет не найден или уже удалён.")
+        return
+
+    user_id = int(ticket["user_id"])
+    try:
+        await message.bot.send_message(
+            user_id,
+            f"<b>📞 Ответ поддержки по тикету #{ticket_id}</b>\n\n"
+            f"<b>Ваш вопрос:</b>\n{safe(ticket['message'])}\n\n"
+            f"<b>Ответ администратора:</b>\n{safe(reply_text)}"
+        )
+        await message.answer(f"✅ Ответ по тикету <b>#{ticket_id}</b> отправлен клиенту.")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to send ticket reply to %s: %s", user_id, exc)
+        await message.answer(
+            f"⚠️ Ответ сохранён, но не удалось отправить клиенту. Возможно, клиент заблокировал бота.\n"
+            f"Тикет: <b>#{ticket_id}</b>"
+        )
+
+
+@router.message(Command("ticket_reply"))
+async def admin_ticket_reply_command_handler(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Формат: <code>/ticket_reply TICKET_ID текст ответа</code>")
+        return
+
+    try:
+        ticket_id = int(parts[1])
+    except ValueError:
+        await message.answer("TICKET_ID должен быть числом.")
+        return
+
+    reply_text = parts[2].strip()
+    ticket = answer_support_ticket(ticket_id, reply_text)
+    if not ticket:
+        await message.answer("❌ Тикет не найден.")
+        return
+
+    user_id = int(ticket["user_id"])
+    try:
+        await message.bot.send_message(
+            user_id,
+            f"<b>📞 Ответ поддержки по тикету #{ticket_id}</b>\n\n"
+            f"<b>Ваш вопрос:</b>\n{safe(ticket['message'])}\n\n"
+            f"<b>Ответ администратора:</b>\n{safe(reply_text)}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to send ticket reply to %s: %s", user_id, exc)
+        await message.answer("⚠️ Ответ сохранён, но не удалось отправить клиенту. Возможно, клиент заблокировал бота.")
+        return
+
+    await message.answer(f"✅ Ответ по тикету <b>#{ticket_id}</b> отправлен клиенту.")
+
+
 @router.callback_query(F.data.startswith("admin_ticket_close:"))
 async def admin_ticket_close_handler(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
@@ -704,12 +804,17 @@ async def admin_ticket_close_handler(callback: CallbackQuery) -> None:
         return
 
     ticket_id = int(callback.data.split(":", 1)[1])
+    ticket = get_support_ticket(ticket_id)
     ok = close_support_ticket(ticket_id)
-    if not ok:
+    if not ok or not ticket:
         await callback.answer("Тикет не найден", show_alert=True)
         return
 
     await callback.message.edit_text((callback.message.text or "") + "\n\n✅ Тикет закрыт администратором.")
+    try:
+        await callback.bot.send_message(int(ticket["user_id"]), f"✅ Ваш тикет поддержки <b>#{ticket_id}</b> закрыт.")
+    except Exception:
+        pass
     await callback.answer("Тикет закрыт")
 
 
