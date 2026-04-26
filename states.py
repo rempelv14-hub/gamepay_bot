@@ -19,6 +19,7 @@ class TopUpFSM(StatesGroup):
 
 class SupportFSM(StatesGroup):
     waiting_message = State()
+    waiting_ticket_reply = State()
 
 
 class AdminBroadcastFSM(StatesGroup):
@@ -27,6 +28,10 @@ class AdminBroadcastFSM(StatesGroup):
 
 class AdminTicketFSM(StatesGroup):
     waiting_reply = State()
+
+
+class AdminOrderFSM(StatesGroup):
+    waiting_message = State()
 
 
 class CalculatorFSM(StatesGroup):
