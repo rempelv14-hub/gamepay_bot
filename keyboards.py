@@ -69,6 +69,7 @@ def support_panel_kb() -> InlineKeyboardMarkup:
 def admin_ticket_kb(ticket_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="✉️ Ответить на тикет", callback_data=f"admin_ticket_reply:{ticket_id}")],
             [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"admin_ticket_close:{ticket_id}")],
         ]
     )
