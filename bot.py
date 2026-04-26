@@ -11,7 +11,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import settings
 from database import (
@@ -21,6 +21,10 @@ from database import (
     count_user_support_tickets,
     close_support_ticket,
     get_support_ticket,
+    get_ticket_messages,
+    add_support_message,
+    list_user_support_tickets,
+    list_active_support_tickets,
     answer_support_ticket,
     get_order,
     get_stats,
@@ -54,12 +58,15 @@ from keyboards import (
     pubg_packages_kb,
     stars_packages_kb,
     support_panel_kb,
+    user_ticket_kb,
     admin_ticket_kb,
     top_up_kb,
     ton_invoice_kb,
+    user_orders_kb,
+    user_order_kb,
 )
 from products import CUSTOM_PRODUCTS, PREMIUM_PACKAGES, PUBG_PACKAGES, STARS_PACKAGES
-from states import AdminBroadcastFSM, AdminTicketFSM, CalculatorFSM, OrderFSM, PubgFSM, SupportFSM, TopUpFSM
+from states import AdminBroadcastFSM, AdminTicketFSM, AdminOrderFSM, CalculatorFSM, OrderFSM, PubgFSM, SupportFSM, TopUpFSM
 from texts import INFO_TEXT, MENU_TEXT
 from ton_payments import find_ton_payment, kzt_to_ton, ton_invoice_comment, ton_is_configured
 
@@ -90,6 +97,14 @@ def order_status_ru(status: str) -> str:
         "work": "в работе",
         "done": "выполнен",
         "cancelled": "отменён",
+    }.get(status, status)
+
+
+def ticket_status_ru(status: str) -> str:
+    return {
+        "open": "открыт",
+        "answered": "ответ поддержки",
+        "closed": "закрыт",
     }.get(status, status)
 
 
@@ -342,13 +357,42 @@ async def profile_handler(event: Message | CallbackQuery) -> None:
 
 @router.callback_query(F.data == "my_orders")
 async def my_orders_handler(callback: CallbackQuery) -> None:
-    orders = get_user_orders(callback.from_user.id, limit=7)
+    orders = get_user_orders(callback.from_user.id, limit=10)
     if not orders:
         await callback.message.answer("У вас пока нет заказов.", reply_markup=back_menu_kb())
         await callback.answer()
         return
-    text = "<b>📦 Ваши последние заказы</b>\n\n" + "\n\n".join(format_order_for_user(o) for o in orders)
-    await callback.message.answer(text, reply_markup=back_menu_kb())
+
+    text = (
+        "<b>📦 Мои заказы</b>\n\n"
+        "Нажмите на заказ, чтобы посмотреть детали, статус и кнопку проверки TON-оплаты."
+    )
+    await callback.message.answer(text, reply_markup=user_orders_kb(orders))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("user_order:"))
+async def user_order_details_handler(callback: CallbackQuery) -> None:
+    order_id = int(callback.data.split(":", 1)[1])
+    order = get_order(order_id)
+    if not order or int(order["user_id"]) != callback.from_user.id:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+
+    invoice = get_ton_invoice_by_order(order_id)
+    extra = ""
+    if invoice:
+        extra = (
+            "\n\n<b>💎 TON-счёт</b>\n"
+            f"Сумма TON: <b>{float(invoice['amount_ton']):g} TON</b>\n"
+            f"Комментарий: <code>{safe(invoice['comment'])}</code>\n"
+            f"Статус оплаты: <b>{safe(invoice['status'])}</b>"
+        )
+
+    await callback.message.answer(
+        format_order_for_user(order) + extra,
+        reply_markup=user_order_kb(order_id, str(order["status"])),
+    )
     await callback.answer()
 
 
@@ -616,17 +660,60 @@ def support_panel_text(user_id: int) -> str:
     active = stats.get("open", 0)
     total = stats.get("total", 0)
     status_line = (
-        "✅ Вы можете создать новый тикет для обращения в поддержку."
+        "✅ Вы можете создать новый тикет или открыть старый диалог."
         if active == 0
-        else "⚠️ У вас уже есть активный тикет. Вы можете создать новый, если вопрос другой."
+        else "⚠️ У вас есть активный тикет. Можно открыть его и продолжить переписку."
     )
     return (
         "<b>📞 Техническая поддержка</b>\n\n"
-        "В этом разделе Вы можете создать тикет для связи с поддержкой.\n\n"
+        "Здесь можно создать тикет, посмотреть историю обращений и продолжить переписку с администратором.\n\n"
         "<b>📊 Статистика:</b>\n"
         f"• Активных тикетов: <b>{active}</b>\n"
         f"• Всего тикетов: <b>{total}</b>\n\n"
         f"{status_line}"
+    )
+
+
+def format_ticket_history(ticket_id: int, for_admin: bool = False, limit: int = 12) -> str:
+    ticket = get_support_ticket(ticket_id)
+    if not ticket:
+        return "Тикет не найден."
+
+    messages = get_ticket_messages(ticket_id, limit=limit)
+    status = ticket_status_ru(ticket["status"])
+    header = (
+        f"<b>🆘 Тикет #{ticket_id}</b>\n"
+        f"Статус: <b>{safe(status)}</b>\n"
+        f"Клиент: {user_mention(ticket['username'], int(ticket['user_id']))}\n"
+        f"Создан: <code>{safe(ticket['created_at'])}</code>\n\n"
+        if for_admin
+        else (
+            f"<b>📨 Ваш тикет #{ticket_id}</b>\n"
+            f"Статус: <b>{safe(status)}</b>\n"
+            f"Создан: <code>{safe(ticket['created_at'])}</code>\n\n"
+        )
+    )
+
+    if not messages:
+        return header + "История пока пустая."
+
+    lines = [header, "<b>История переписки:</b>"]
+    for msg in messages:
+        sender = "👤 Клиент" if msg["sender"] == "user" else "🛠 Поддержка"
+        lines.append(f"\n<b>{sender}</b> <code>{safe(msg['created_at'])}</code>\n{safe(msg['message'])}")
+
+    return "\n".join(lines)
+
+
+def ticket_admin_notice(ticket_id: int, ticket: Any, text: str, is_reply: bool = False) -> str:
+    title = "💬 Новое сообщение в тикете" if is_reply else "🆘 Новый тикет поддержки"
+    return (
+        f"<b>{title} #{ticket_id}</b>\n\n"
+        f"👤 Клиент: {user_mention(ticket['username'], int(ticket['user_id']))}\n"
+        f"🆔 User ID: <code>{ticket['user_id']}</code>\n"
+        f"🔗 Username: @{safe(ticket['username']) if ticket['username'] else 'не указан'}\n\n"
+        f"<b>Сообщение:</b>\n{safe(text)}\n\n"
+        f"Ответить можно кнопкой ниже или командой:\n<code>/ticket_reply {ticket_id} ваш текст</code>"
     )
 
 
@@ -646,7 +733,7 @@ async def support_create_handler(callback: CallbackQuery, state: FSMContext) -> 
     await callback.message.answer(
         "<b>📝 Новый тикет</b>\n\n"
         "Опишите проблему одним сообщением.\n"
-        "Например: что хотели купить, номер заказа, что не получилось или какую ошибку видите.",
+        "Например: номер заказа, что хотели купить, что не получилось или какую ошибку видите.",
         reply_markup=back_menu_kb(),
     )
     await callback.answer()
@@ -661,25 +748,166 @@ async def support_message_handler(message: Message, state: FSMContext) -> None:
 
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
     ticket_id = create_support_ticket(message.from_user.id, message.from_user.username, text)
+    ticket = get_support_ticket(ticket_id)
 
-    if settings.admin_id:
+    if settings.admin_id and ticket:
         await message.bot.send_message(
             settings.admin_id,
-            f"<b>🆘 Новый тикет поддержки #{ticket_id}</b>\n\n"
-            f"👤 Клиент: {user_mention(message.from_user.username, message.from_user.id)}\n"
-            f"🆔 User ID: <code>{message.from_user.id}</code>\n"
-            f"🔗 Username: @{safe(message.from_user.username) if message.from_user.username else 'не указан'}\n\n"
-            f"<b>Жалоба / вопрос:</b>\n{safe(text)}\n\n"
-            f"Ответить можно кнопкой ниже или командой:\n<code>/ticket_reply {ticket_id} ваш текст</code>",
+            ticket_admin_notice(ticket_id, ticket, text, is_reply=False),
             reply_markup=admin_ticket_kb(ticket_id),
         )
 
     await state.clear()
     await message.answer(
         f"✅ Тикет <b>#{ticket_id}</b> создан.\n\n"
-        "Ваше сообщение отправлено администратору. Ожидайте ответа.",
+        "Ваше сообщение отправлено администратору. Ответ придёт прямо сюда.\n"
+        "Вы также можете открыть тикет и продолжить переписку.",
+        reply_markup=user_ticket_kb(ticket_id),
+    )
+
+
+@router.callback_query(F.data == "support_my_tickets")
+async def support_my_tickets_handler(callback: CallbackQuery) -> None:
+    tickets = list_user_support_tickets(callback.from_user.id, limit=8)
+    if not tickets:
+        await callback.message.answer(
+            "У вас пока нет тикетов поддержки.",
+            reply_markup=support_panel_kb(),
+        )
+        await callback.answer()
+        return
+
+    rows = []
+    text_lines = ["<b>📋 Мои тикеты</b>\n"]
+    for ticket in tickets:
+        status = ticket_status_ru(ticket["status"])
+        text_lines.append(
+            f"#{ticket['id']} — <b>{safe(status)}</b> — {safe(ticket['created_at'])}"
+        )
+        rows.append([InlineKeyboardButton(
+            text=f"#{ticket['id']} — {status}",
+            callback_data=f"support_ticket_view:{ticket['id']}",
+        )])
+    rows.append([InlineKeyboardButton(text="📝 Создать тикет", callback_data="support_create")])
+    rows.append([InlineKeyboardButton(text="⬅️ В поддержку", callback_data="support")])
+
+    await callback.message.answer(
+        "\n".join(text_lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("support_ticket_view:"))
+async def support_ticket_view_handler(callback: CallbackQuery) -> None:
+    ticket_id = int(callback.data.split(":", 1)[1])
+    ticket = get_support_ticket(ticket_id)
+    if not ticket or int(ticket["user_id"]) != callback.from_user.id:
+        await callback.answer("Тикет не найден", show_alert=True)
+        return
+
+    await callback.message.answer(
+        format_ticket_history(ticket_id, for_admin=False),
+        reply_markup=user_ticket_kb(ticket_id, is_closed=ticket["status"] == "closed"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("support_ticket_reply:"))
+async def support_ticket_reply_button_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    ticket_id = int(callback.data.split(":", 1)[1])
+    ticket = get_support_ticket(ticket_id)
+    if not ticket or int(ticket["user_id"]) != callback.from_user.id:
+        await callback.answer("Тикет не найден", show_alert=True)
+        return
+    if ticket["status"] == "closed":
+        await callback.answer("Этот тикет уже закрыт", show_alert=True)
+        return
+
+    await state.set_state(SupportFSM.waiting_ticket_reply)
+    await state.update_data(ticket_id=ticket_id)
+    await callback.message.answer(
+        f"✍️ Напишите сообщение в тикет <b>#{ticket_id}</b> одним сообщением.\n\n"
+        "Для отмены используйте /cancel",
         reply_markup=back_menu_kb(),
     )
+    await callback.answer()
+
+
+@router.message(SupportFSM.waiting_ticket_reply)
+async def support_ticket_reply_text_handler(message: Message, state: FSMContext) -> None:
+    text = (message.text or message.caption or "").strip()
+    if len(text) < 2:
+        await message.answer("Сообщение слишком короткое. Напишите подробнее или /cancel.")
+        return
+
+    data = await state.get_data()
+    ticket_id = int(data.get("ticket_id", 0))
+    ticket = add_support_message(ticket_id, "user", message.from_user.id, message.from_user.username, text)
+    await state.clear()
+
+    if not ticket:
+        await message.answer("❌ Тикет не найден или уже закрыт.")
+        return
+
+    if settings.admin_id:
+        await message.bot.send_message(
+            settings.admin_id,
+            ticket_admin_notice(ticket_id, ticket, text, is_reply=True),
+            reply_markup=admin_ticket_kb(ticket_id),
+        )
+
+    await message.answer(
+        f"✅ Сообщение добавлено в тикет <b>#{ticket_id}</b>.\n"
+        "Администратор получил уведомление.",
+        reply_markup=user_ticket_kb(ticket_id),
+    )
+
+
+@router.callback_query(F.data.startswith("support_ticket_close:"))
+async def support_ticket_close_handler(callback: CallbackQuery) -> None:
+    ticket_id = int(callback.data.split(":", 1)[1])
+    ticket = get_support_ticket(ticket_id)
+    if not ticket or int(ticket["user_id"]) != callback.from_user.id:
+        await callback.answer("Тикет не найден", show_alert=True)
+        return
+
+    ok = close_support_ticket(ticket_id)
+    if not ok:
+        await callback.answer("Не удалось закрыть тикет", show_alert=True)
+        return
+
+    if settings.admin_id:
+        await callback.bot.send_message(
+            settings.admin_id,
+            f"✅ Клиент закрыл тикет поддержки <b>#{ticket_id}</b>.\n"
+            f"Клиент: {user_mention(ticket['username'], int(ticket['user_id']))}"
+        )
+
+    await callback.message.answer(
+        f"✅ Тикет <b>#{ticket_id}</b> закрыт.",
+        reply_markup=support_panel_kb(),
+    )
+    await callback.answer("Тикет закрыт")
+
+
+@router.callback_query(F.data.startswith("admin_ticket_history:"))
+async def admin_ticket_history_handler(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    ticket_id = int(callback.data.split(":", 1)[1])
+    ticket = get_support_ticket(ticket_id)
+    if not ticket:
+        await callback.answer("Тикет не найден", show_alert=True)
+        return
+
+    await callback.message.answer(
+        format_ticket_history(ticket_id, for_admin=True),
+        reply_markup=admin_ticket_kb(ticket_id) if ticket["status"] != "closed" else admin_panel_kb(),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin_ticket_reply:"))
@@ -693,13 +921,16 @@ async def admin_ticket_reply_button_handler(callback: CallbackQuery, state: FSMC
     if not ticket:
         await callback.answer("Тикет не найден", show_alert=True)
         return
+    if ticket["status"] == "closed":
+        await callback.answer("Этот тикет уже закрыт", show_alert=True)
+        return
 
     await state.set_state(AdminTicketFSM.waiting_reply)
     await state.update_data(ticket_id=ticket_id)
     await callback.message.answer(
         f"✉️ Введите ответ на тикет <b>#{ticket_id}</b> одним сообщением.\n\n"
         f"Клиент: {user_mention(ticket['username'], int(ticket['user_id']))}\n"
-        f"Вопрос: {safe(ticket['message'])}\n\n"
+        f"Последнее сообщение: {safe(ticket['message'])}\n\n"
         "Для отмены используйте /cancel"
     )
     await callback.answer()
@@ -721,7 +952,7 @@ async def admin_ticket_reply_text_handler(message: Message, state: FSMContext) -
     await state.clear()
 
     if not ticket:
-        await message.answer("❌ Тикет не найден или уже удалён.")
+        await message.answer("❌ Тикет не найден или уже закрыт.")
         return
 
     user_id = int(ticket["user_id"])
@@ -729,10 +960,14 @@ async def admin_ticket_reply_text_handler(message: Message, state: FSMContext) -
         await message.bot.send_message(
             user_id,
             f"<b>📞 Ответ поддержки по тикету #{ticket_id}</b>\n\n"
-            f"<b>Ваш вопрос:</b>\n{safe(ticket['message'])}\n\n"
-            f"<b>Ответ администратора:</b>\n{safe(reply_text)}"
+            f"{safe(reply_text)}\n\n"
+            "Вы можете продолжить переписку через раздел <b>📞 Поддержка → 📋 Мои тикеты</b>.",
+            reply_markup=user_ticket_kb(ticket_id),
         )
-        await message.answer(f"✅ Ответ по тикету <b>#{ticket_id}</b> отправлен клиенту.")
+        await message.answer(
+            f"✅ Ответ по тикету <b>#{ticket_id}</b> отправлен клиенту.",
+            reply_markup=admin_ticket_kb(ticket_id),
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to send ticket reply to %s: %s", user_id, exc)
         await message.answer(
@@ -761,7 +996,7 @@ async def admin_ticket_reply_command_handler(message: Message) -> None:
     reply_text = parts[2].strip()
     ticket = answer_support_ticket(ticket_id, reply_text)
     if not ticket:
-        await message.answer("❌ Тикет не найден.")
+        await message.answer("❌ Тикет не найден или уже закрыт.")
         return
 
     user_id = int(ticket["user_id"])
@@ -769,15 +1004,16 @@ async def admin_ticket_reply_command_handler(message: Message) -> None:
         await message.bot.send_message(
             user_id,
             f"<b>📞 Ответ поддержки по тикету #{ticket_id}</b>\n\n"
-            f"<b>Ваш вопрос:</b>\n{safe(ticket['message'])}\n\n"
-            f"<b>Ответ администратора:</b>\n{safe(reply_text)}"
+            f"{safe(reply_text)}\n\n"
+            "Вы можете продолжить переписку через раздел <b>📞 Поддержка → 📋 Мои тикеты</b>.",
+            reply_markup=user_ticket_kb(ticket_id),
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to send ticket reply to %s: %s", user_id, exc)
         await message.answer("⚠️ Ответ сохранён, но не удалось отправить клиенту. Возможно, клиент заблокировал бота.")
         return
 
-    await message.answer(f"✅ Ответ по тикету <b>#{ticket_id}</b> отправлен клиенту.")
+    await message.answer(f"✅ Ответ по тикету <b>#{ticket_id}</b> отправлен клиенту.", reply_markup=admin_ticket_kb(ticket_id))
 
 
 @router.callback_query(F.data.startswith("admin_ticket_close:"))
@@ -795,10 +1031,46 @@ async def admin_ticket_close_handler(callback: CallbackQuery) -> None:
 
     await callback.message.edit_text((callback.message.text or "") + "\n\n✅ Тикет закрыт администратором.")
     try:
-        await callback.bot.send_message(int(ticket["user_id"]), f"✅ Ваш тикет поддержки <b>#{ticket_id}</b> закрыт.")
+        await callback.bot.send_message(
+            int(ticket["user_id"]),
+            f"✅ Ваш тикет поддержки <b>#{ticket_id}</b> закрыт.\n\n"
+            "Если вопрос снова появится, создайте новый тикет в разделе поддержки.",
+        )
     except Exception:
         pass
     await callback.answer("Тикет закрыт")
+
+
+@router.callback_query(F.data == "admin_tickets")
+async def admin_tickets_handler(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    tickets = list_active_support_tickets(limit=10)
+    if not tickets:
+        await callback.message.answer("Активных тикетов нет.", reply_markup=admin_panel_kb())
+        await callback.answer()
+        return
+
+    rows = []
+    lines = ["<b>🆘 Активные тикеты</b>\n"]
+    for ticket in tickets:
+        status = ticket_status_ru(ticket["status"])
+        lines.append(
+            f"#{ticket['id']} — {user_mention(ticket['username'], int(ticket['user_id']))} — <b>{safe(status)}</b>"
+        )
+        rows.append([InlineKeyboardButton(
+            text=f"#{ticket['id']} — {status}",
+            callback_data=f"admin_ticket_history:{ticket['id']}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ В админку", callback_data="admin_stats")])
+
+    await callback.message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "calculator")
@@ -967,7 +1239,7 @@ async def admin_done_handler(callback: CallbackQuery) -> None:
     await pay_referral_bonus(callback.bot, get_order(order_id))
 
     try:
-        await callback.message.edit_text(format_order_for_admin(get_order(order_id)))
+        await callback.message.edit_text(format_order_for_admin(get_order(order_id)), reply_markup=admin_order_kb(order_id))
     except Exception:
         pass
     await callback.bot.send_message(
@@ -996,7 +1268,7 @@ async def admin_cancel_handler(callback: CallbackQuery) -> None:
 
     update_order_status(order_id, "cancelled")
     try:
-        await callback.message.edit_text(format_order_for_admin(get_order(order_id)))
+        await callback.message.edit_text(format_order_for_admin(get_order(order_id)), reply_markup=admin_order_kb(order_id))
     except Exception:
         pass
     await callback.bot.send_message(
@@ -1004,6 +1276,92 @@ async def admin_cancel_handler(callback: CallbackQuery) -> None:
         f"❌ Ваш заказ <b>#{order_id}</b> отменён.\n\nЕсли нужна помощь — напишите в поддержку.",
     )
     await callback.answer("Заказ отменён")
+
+
+@router.callback_query(F.data.startswith("admin_order_msg:"))
+async def admin_order_message_button_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    order_id = int(callback.data.split(":", 1)[1])
+    order = get_order(order_id)
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+
+    await state.set_state(AdminOrderFSM.waiting_message)
+    await state.update_data(order_id=order_id)
+    await callback.message.answer(
+        f"✉️ Напишите сообщение клиенту по заказу <b>#{order_id}</b>.\n"
+        "Оно уйдёт клиенту от имени бота. Для отмены: /cancel"
+    )
+    await callback.answer()
+
+
+@router.message(AdminOrderFSM.waiting_message)
+async def admin_order_message_text_handler(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+
+    data = await state.get_data()
+    order_id = int(data.get("order_id") or 0)
+    order = get_order(order_id)
+    text_to_send = (message.html_text or message.text or "").strip()
+
+    if not order:
+        await state.clear()
+        await message.answer("❌ Заказ не найден.", reply_markup=admin_panel_kb())
+        return
+    if len(text_to_send) < 2:
+        await message.answer("Сообщение слишком короткое. Напишите текст для клиента.")
+        return
+
+    user_id = int(order["user_id"])
+    try:
+        await message.bot.send_message(
+            user_id,
+            f"✉️ <b>Сообщение по заказу #{order_id}</b>\n\n{text_to_send}",
+            reply_markup=user_order_kb(order_id, str(order["status"])),
+        )
+        await message.answer(
+            f"✅ Сообщение клиенту по заказу <b>#{order_id}</b> отправлено.",
+            reply_markup=admin_order_kb(order_id),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Cannot send order message to %s: %s", user_id, exc)
+        await message.answer("❌ Не удалось отправить сообщение клиенту.", reply_markup=admin_order_kb(order_id))
+
+    await state.clear()
+
+
+@router.message(Command("order_reply"))
+async def admin_order_reply_command_handler(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Формат: <code>/order_reply ORDER_ID текст сообщения</code>")
+        return
+
+    try:
+        order_id = int(parts[1])
+    except ValueError:
+        await message.answer("ORDER_ID должен быть числом.")
+        return
+
+    order = get_order(order_id)
+    if not order:
+        await message.answer("❌ Заказ не найден.")
+        return
+
+    await message.bot.send_message(
+        int(order["user_id"]),
+        f"✉️ <b>Сообщение по заказу #{order_id}</b>\n\n{safe(parts[2])}",
+        reply_markup=user_order_kb(order_id, str(order["status"])),
+    )
+    await message.answer(f"✅ Сообщение по заказу <b>#{order_id}</b> отправлено.", reply_markup=admin_order_kb(order_id))
 
 
 @router.callback_query(F.data == "admin_create_promo")
