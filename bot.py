@@ -41,6 +41,7 @@ from database import (
     get_product_item,
     get_product_price,
     get_user,
+    get_user_currency,
     get_user_orders,
     get_user_activity_stats,
     get_users,
@@ -55,6 +56,7 @@ from database import (
     list_pending_ton_invoices,
     mark_ton_invoice_paid,
     set_product_price,
+    set_user_currency,
     toggle_product_enabled,
     update_order_status,
     upsert_user,
@@ -66,6 +68,7 @@ from keyboards import (
     admin_products_kb,
     calculator_choice_kb,
     calculator_result_kb,
+    currency_choice_kb,
     back_menu_kb,
     bottom_menu_kb,
     main_menu_kb,
@@ -80,6 +83,7 @@ from keyboards import (
     user_ticket_kb,
     admin_ticket_kb,
     top_up_kb,
+    money_multi,
     ton_invoice_kb,
     user_orders_kb,
     user_order_kb,
@@ -87,6 +91,7 @@ from keyboards import (
 from products import CUSTOM_PRODUCTS, PREMIUM_PACKAGES, PUBG_PACKAGES, STARS_PACKAGES
 from states import AdminBroadcastFSM, AdminProductFSM, AdminTicketFSM, AdminOrderFSM, CalculatorFSM, NoCommentFSM, OrderFSM, PubgFSM, SupportFSM, TopUpFSM
 from texts import INFO_TEXT, MENU_TEXT
+from currency_utils import format_money, format_money_multi, kzt_to_currency, normalize_currency, parse_amount, payment_details_for
 from ton_payments import find_ton_payment, get_ton_rate_kzt, kzt_to_ton, ton_invoice_comment, ton_is_configured
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -200,6 +205,38 @@ def current_package_prices(kind: str, fallback: dict[str, float | int]) -> dict[
     return {str(k): float(v) for k, v in fallback.items()}
 
 
+def user_currency(user_id: int) -> str:
+    return get_user_currency(user_id)
+
+
+def money_for_user(amount_kzt: float | int, user_id: int) -> str:
+    currency = user_currency(user_id)
+    main = format_money(float(amount_kzt), currency)
+    other = format_money(float(amount_kzt), "RUB" if currency == "KZT" else "KZT")
+    return f"{main} / {other}"
+
+
+def order_currency(order: dict[str, Any] | Any) -> str:
+    try:
+        return normalize_currency(order["currency"])
+    except Exception:
+        return "KZT"
+
+
+def order_amount_text(order: dict[str, Any] | Any) -> str:
+    price = float(order["price"] or 0)
+    cur = order_currency(order)
+    return f"{format_money(price, cur)} / {format_money(price, 'KZT' if cur == 'RUB' else 'RUB')}"
+
+
+def manual_payment_title(payment_method: str) -> str:
+    if payment_method == "manual_rub":
+        return "ручная оплата ₽"
+    if payment_method == "manual_kzt":
+        return "ручная оплата ₸"
+    return payment_method
+
+
 def format_order_for_admin(order: dict[str, Any] | Any) -> str:
     username = order["username"] or "без username"
     return (
@@ -208,8 +245,8 @@ def format_order_for_admin(order: dict[str, Any] | Any) -> str:
         f"🆔 User ID: <code>{order['user_id']}</code>\n\n"
         f"📂 Категория: <b>{safe(order['category'])}</b>\n"
         f"📦 Товар: <b>{safe(order['product'])}</b>\n"
-        f"💵 Цена/сумма: <b>{money(float(order['price'] or 0))}</b>\n"
-        f"💳 Оплата: <b>{safe(order['payment_method'])}</b>\n"
+        f"💵 Цена/сумма: <b>{order_amount_text(order)}</b>\n"
+        f"💳 Оплата: <b>{safe(manual_payment_title(str(order['payment_method'])))}</b>\n"
         f"📝 Детали: {safe(order['details'])}\n\n"
         f"📌 Статус: <b>{order_status_ru(order['status'])}</b>\n"
         f"🕒 Создан: <code>{order['created_at']}</code>"
@@ -220,7 +257,7 @@ def format_order_for_user(order: dict[str, Any] | Any) -> str:
     return (
         f"<b>Заказ #{order['id']}</b>\n"
         f"Товар: {safe(order['product'])}\n"
-        f"Цена/сумма: {money(float(order['price'] or 0))}\n"
+        f"Цена/сумма: {order_amount_text(order)}\n"
         f"Статус: {order_status_ru(order['status'])}\n"
         f"Дата: <code>{order['created_at']}</code>"
     )
@@ -250,9 +287,9 @@ async def finish_order_from_state(callback: CallbackQuery, state: FSMContext, pa
         if balance < price:
             await callback.message.answer(
                 f"❌ Недостаточно средств на балансе.\n\n"
-                f"Нужно: <b>{money(price)}</b>\n"
-                f"Ваш баланс: <b>{money(balance)}</b>\n\n"
-                f"Пополните баланс или создайте заявку с ручной оплатой.",
+                f"Нужно: <b>{format_money(price, 'KZT')}</b>\n"
+                f"Ваш баланс: <b>{format_money(balance, 'KZT')}</b>\n\n"
+                f"Баланс внутри бота хранится в ₸. Пополните баланс или создайте заявку с ручной оплатой.",
                 reply_markup=top_up_kb(),
             )
             await callback.answer()
@@ -267,9 +304,12 @@ async def finish_order_from_state(callback: CallbackQuery, state: FSMContext, pa
             price=price,
             payment_method="balance",
             status="paid",
+            currency="KZT",
+            display_amount=price,
         )
         change_balance(callback.from_user.id, -price, f"Оплата заказа #{order_id}", order_id)
     else:
+        payment_currency = "RUB" if payment_method == "manual_rub" else "KZT"
         order_id = create_order(
             user_id=callback.from_user.id,
             username=callback.from_user.username,
@@ -277,8 +317,10 @@ async def finish_order_from_state(callback: CallbackQuery, state: FSMContext, pa
             product=product,
             details=details,
             price=price,
-            payment_method="manual",
+            payment_method=payment_method,
             status="new",
+            currency=payment_currency,
+            display_amount=kzt_to_currency(price, payment_currency),
         )
 
     await notify_admin_order(callback.bot, order_id)
@@ -286,22 +328,31 @@ async def finish_order_from_state(callback: CallbackQuery, state: FSMContext, pa
 
     if payment_method == "balance" and price > 0:
         payment_text = "Оплата списана с вашего баланса."
+        amount_text = format_money(price, "KZT")
     else:
+        payment_currency = "RUB" if payment_method == "manual_rub" else "KZT"
+        amount_text = format_money(price, payment_currency)
+        extra = ""
+        if payment_currency == "RUB":
+            extra = f"\nЭквивалент в тенге: <b>{format_money(price, 'KZT')}</b>"
+        else:
+            extra = f"\nЭквивалент в рублях: <b>{format_money(price, 'RUB')}</b>"
         payment_text = (
-            "Администратор проверит заявку.\n\n"
-            "Для ручной оплаты используйте реквизиты:\n"
-            f"<blockquote>{safe(settings.payment_details)}</blockquote>"
+            f"Вы выбрали ручную оплату в <b>{'рублях' if payment_currency == 'RUB' else 'тенге'}</b>.\n"
+            f"Сумма к оплате: <b>{amount_text}</b>{extra}\n\n"
+            "После оплаты отправьте чек/скрин в поддержку или администратору.\n\n"
+            "Реквизиты:\n"
+            f"<blockquote>{safe(payment_details_for(payment_currency))}</blockquote>"
         )
 
     await callback.message.answer(
         f"✅ Заявка <b>#{order_id}</b> создана.\n\n"
         f"📦 {safe(product)}\n"
-        f"💵 {money(price)}\n\n"
+        f"💵 {amount_text}\n\n"
         f"{payment_text}",
         reply_markup=back_menu_kb(),
     )
     await callback.answer("Заявка создана")
-
 
 async def pay_referral_bonus(bot: Bot, order: Any) -> None:
     if int(order["reward_paid"] or 0) == 1:
@@ -441,10 +492,11 @@ async def profile_handler(event: Message | CallbackQuery) -> None:
         "<b>👤 Ваш профиль</b>\n\n"
         f"ID: <code>{user.id}</code>\n"
         f"Username: @{safe(user.username) if user.username else 'не указан'}\n"
-        f"Баланс: <b>{money(balance)}</b>\n"
+        f"Валюта интерфейса: <b>{user_currency(user.id)}</b>\n"
+        f"Баланс: <b>{format_money(balance, 'KZT')} / {format_money(balance, 'RUB')}</b>\n"
         f"Заказов всего: <b>{activity['orders_count']}</b>\n"
         f"Выполнено: <b>{activity['done_orders']}</b>\n"
-        f"Покупок на сумму: <b>{money(activity['total_spent'])}</b>\n"
+        f"Покупок на сумму: <b>{format_money(activity['total_spent'], 'KZT')} / {format_money(activity['total_spent'], 'RUB')}</b>\n"
         f"Приглашено людей: <b>{activity['refs_count']}</b>\n\n"
         "<b>🤝 Партнёрская ссылка</b>\n"
         f"https://t.me/{bot_username}?start=ref_{user.id}\n"
@@ -456,6 +508,48 @@ async def profile_handler(event: Message | CallbackQuery) -> None:
         await event.answer()
     else:
         await event.answer(text, reply_markup=profile_kb())
+
+
+@router.message(Command("currency"))
+@router.message(F.text == "🌍 Валюта")
+async def currency_message_handler(message: Message) -> None:
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
+    current = user_currency(message.from_user.id)
+    await message.answer(
+        "<b>🌍 Валюта</b>\n\n"
+        "Выберите удобную валюту для отображения цен и ручной оплаты.\n"
+        f"Текущая валюта: <b>{current}</b>\n\n"
+        f"Курс для расчёта: <b>1 ₽ = {settings.rub_to_kzt_rate:g}₸</b>.",
+        reply_markup=currency_choice_kb(current),
+    )
+
+
+@router.callback_query(F.data == "currency")
+async def currency_callback_handler(callback: CallbackQuery) -> None:
+    upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.full_name)
+    current = user_currency(callback.from_user.id)
+    await callback.message.answer(
+        "<b>🌍 Валюта</b>\n\n"
+        "Выберите удобную валюту для отображения цен и ручной оплаты.\n"
+        f"Текущая валюта: <b>{current}</b>\n\n"
+        f"Курс для расчёта: <b>1 ₽ = {settings.rub_to_kzt_rate:g}₸</b>.",
+        reply_markup=currency_choice_kb(current),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("set_currency:"))
+async def set_currency_handler(callback: CallbackQuery) -> None:
+    code = normalize_currency(callback.data.split(":", 1)[1])
+    set_user_currency(callback.from_user.id, code)
+    await callback.message.answer(
+        f"✅ Валюта изменена на <b>{'тенге ₸' if code == 'KZT' else 'рубли ₽'}</b>.\n\n"
+        "Цены в боте будут показываться с учётом этой валюты, а ручную оплату можно выбрать в ₸ или ₽ при оформлении заказа.",
+        reply_markup=back_menu_kb(),
+    )
+    await callback.answer("Валюта сохранена")
+
+
 
 
 @router.callback_query(F.data == "my_orders")
@@ -557,7 +651,7 @@ async def fixed_product_handler(callback: CallbackQuery, state: FSMContext) -> N
     await state.update_data(category=category, product=product, price=price)
     await callback.message.answer(
         f"<b>{safe(product)}</b>\n"
-        f"Цена: <b>{money(price)}</b>\n\n"
+        f"Цена: <b>{money_multi(price)}</b>\n\n"
         f"{prompt}",
         reply_markup=back_menu_kb(),
     )
@@ -597,8 +691,8 @@ async def order_details_handler(message: Message, state: FSMContext) -> None:
         await message.answer(
             f"<b>{safe(product)}</b>\n\n"
             f"📝 Детали: {safe(text)}\n\n"
-            "Введите сумму заказа в тенге, чтобы бот создал TON-оплату.\n"
-            "Пример: <code>2500</code>",
+            "Введите сумму заказа в тенге или рублях.\n"
+            "Пример: <code>2500</code> или <code>500₽</code>",
             reply_markup=back_menu_kb(),
         )
         return
@@ -607,7 +701,7 @@ async def order_details_handler(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"<b>Проверьте заявку</b>\n\n"
         f"📦 Товар: <b>{safe(product)}</b>\n"
-        f"💵 Цена: <b>{money(price)}</b>\n"
+        f"💵 Цена: <b>{money_multi(price)}</b>\n"
         f"📝 Детали: {safe(text)}\n\n"
         f"Выберите способ оформления:",
         reply_markup=payment_choice_kb(price),
@@ -616,19 +710,14 @@ async def order_details_handler(message: Message, state: FSMContext) -> None:
 
 @router.message(OrderFSM.waiting_custom_price)
 async def order_custom_price_handler(message: Message, state: FSMContext) -> None:
-    raw = (message.text or "").replace(" ", "").replace(",", ".")
     try:
-        price = float(raw)
+        price, detected_currency, original_amount = parse_amount(message.text or "", user_currency(message.from_user.id))
     except ValueError:
-        await message.answer("Введите сумму цифрами. Пример: 2500")
-        return
-
-    if price <= 0:
-        await message.answer("Сумма должна быть больше 0.")
+        await message.answer("Введите сумму цифрами. Пример: 2500 или 500₽")
         return
 
     data = await state.get_data()
-    await state.update_data(price=price)
+    await state.update_data(price=price, input_currency=detected_currency, input_amount=original_amount)
     await state.set_state(OrderFSM.waiting_payment)
 
     product = data.get("product", "Заявка")
@@ -636,7 +725,7 @@ async def order_custom_price_handler(message: Message, state: FSMContext) -> Non
     await message.answer(
         f"<b>Проверьте заявку</b>\n\n"
         f"📦 Товар: <b>{safe(product)}</b>\n"
-        f"💵 Цена: <b>{money(price)}</b>\n"
+        f"💵 Цена: <b>{money_multi(price)}</b>\n"
         f"📝 Детали: {safe(details)}\n\n"
         "Выберите способ оформления:",
         reply_markup=payment_choice_kb(price),
@@ -645,12 +734,19 @@ async def order_custom_price_handler(message: Message, state: FSMContext) -> Non
 
 @router.callback_query(StateFilter(OrderFSM.waiting_payment), F.data == "pay:balance")
 async def pay_balance_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if data.get("category") == "top_up":
+        await callback.answer("Пополнение нельзя оплатить внутренним балансом", show_alert=True)
+        return
     await finish_order_from_state(callback, state, "balance")
 
 
-@router.callback_query(StateFilter(OrderFSM.waiting_payment), F.data == "pay:manual")
+@router.callback_query(StateFilter(OrderFSM.waiting_payment), F.data.in_({"pay:manual", "pay:manual_kzt", "pay:manual_rub"}))
 async def pay_manual_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await finish_order_from_state(callback, state, "manual")
+    method = callback.data.split(":", 1)[1]
+    if method == "manual":
+        method = "manual_kzt"
+    await finish_order_from_state(callback, state, method)
 
 
 # =========================
@@ -700,7 +796,7 @@ async def pubg_package_handler(callback: CallbackQuery, state: FSMContext) -> No
         f"<b>Проверьте заявку</b>\n\n"
         f"🎮 PUBG ID: <code>{safe(pubg_id)}</code>\n"
         f"📦 Пакет: <b>{uc} UC</b>\n"
-        f"💵 Цена: <b>{money(price)}</b>\n\n"
+        f"💵 Цена: <b>{money_multi(price)}</b>\n\n"
         f"Выберите способ оформления:",
         reply_markup=payment_choice_kb(price),
     )
@@ -721,48 +817,50 @@ async def top_up_handler(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("topup_amount:"))
 async def topup_amount_handler(callback: CallbackQuery, state: FSMContext) -> None:
     amount = float(callback.data.split(":", 1)[1])
-    await create_ton_payment_order(
-        bot=callback.bot,
-        user_id=callback.from_user.id,
-        username=callback.from_user.username,
+    await state.set_state(OrderFSM.waiting_payment)
+    await state.update_data(
         category="top_up",
         product="Пополнение баланса",
-        details=f"TON-пополнение баланса на {money(amount)}",
+        details=f"Пополнение баланса на {money_multi(amount)}",
         price=amount,
-        target_message=callback.message,
-        state=state,
+    )
+    await callback.message.answer(
+        f"<b>💰 Пополнение баланса</b>\n\n"
+        f"Сумма: <b>{money_multi(amount)}</b>\n\n"
+        "Выберите способ оплаты:",
+        reply_markup=payment_choice_kb(amount),
     )
     await callback.answer()
-
 
 @router.callback_query(F.data == "topup_custom")
 async def topup_custom_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(TopUpFSM.waiting_amount)
-    await callback.message.answer("Введите сумму пополнения цифрами.\n\nПример: 1500")
+    await callback.message.answer("Введите сумму пополнения цифрами в ₸ или ₽.\n\nПример: 1500 или 250₽")
     await callback.answer()
 
 
 @router.message(TopUpFSM.waiting_amount)
 async def topup_custom_amount_handler(message: Message, state: FSMContext) -> None:
-    raw = (message.text or "").replace(" ", "").replace(",", ".")
     try:
-        amount = float(raw)
+        amount, detected_currency, original_amount = parse_amount(message.text or "", user_currency(message.from_user.id))
     except ValueError:
-        await message.answer("Введите сумму цифрами. Пример: 1500")
+        await message.answer("Введите сумму цифрами. Пример: 1500 или 250₽")
         return
-    if amount <= 0:
-        await message.answer("Сумма должна быть больше 0.")
-        return
-    await create_ton_payment_order(
-        bot=message.bot,
-        user_id=message.from_user.id,
-        username=message.from_user.username,
+
+    await state.set_state(OrderFSM.waiting_payment)
+    await state.update_data(
         category="top_up",
         product="Пополнение баланса",
-        details=f"TON-пополнение баланса на {money(amount)}",
+        details=f"Пополнение баланса на {money_multi(amount)}",
         price=amount,
-        target_message=message,
-        state=state,
+        input_currency=detected_currency,
+        input_amount=original_amount,
+    )
+    await message.answer(
+        f"<b>💰 Пополнение баланса</b>\n\n"
+        f"Сумма: <b>{money_multi(amount)}</b>\n\n"
+        "Выберите способ оплаты:",
+        reply_markup=payment_choice_kb(amount),
     )
 @router.callback_query(F.data == "promo")
 async def promo_disabled_handler(callback: CallbackQuery) -> None:
@@ -1193,9 +1291,9 @@ async def calculator_handler(callback: CallbackQuery, state: FSMContext) -> None
     stars_prices = current_package_prices("stars", STARS_PACKAGES)
     premium_prices = current_package_prices("premium", PREMIUM_PACKAGES)
     pubg_prices = current_package_prices("pubg", PUBG_PACKAGES)
-    lines.append("Stars: " + ", ".join([f"{amount} — {money(price)}" for amount, price in stars_prices.items()]))
-    lines.append("Premium: " + ", ".join([f"{months} мес. — {money(price)}" for months, price in premium_prices.items()]))
-    lines.append("PUBG UC: " + ", ".join([f"{uc} — {money(price)}" for uc, price in pubg_prices.items()]))
+    lines.append("Stars: " + ", ".join([f"{amount} — {money_multi(price)}" for amount, price in stars_prices.items()]))
+    lines.append("Premium: " + ", ".join([f"{months} мес. — {money_multi(price)}" for months, price in premium_prices.items()]))
+    lines.append("PUBG UC: " + ", ".join([f"{uc} — {money_multi(price)}" for uc, price in pubg_prices.items()]))
     await callback.message.answer("\n".join(lines), reply_markup=calculator_choice_kb())
     await callback.answer()
 
@@ -1240,7 +1338,7 @@ async def calculator_amount_handler(message: Message, state: FSMContext) -> None
     await message.answer(
         f"<b>🧮 Расчёт</b>\n\n"
         f"Товар: <b>{safe(title)}</b>\n"
-        f"Цена: <b>{money(price)}</b>\n"
+        f"Цена: <b>{money_multi(price)}</b>\n"
         f"Тип расчёта: {safe(note)}\n\n"
         f"Для точного оформления нажмите кнопку ниже и выберите пакет.",
         reply_markup=calculator_result_kb(kind),
@@ -1394,8 +1492,8 @@ async def admin_product_price_handler(callback: CallbackQuery, state: FSMContext
     await state.set_state(AdminProductFSM.waiting_price)
     await state.update_data(sku=sku)
     await callback.message.answer(
-        f"Введите новую цену для <b>{safe(item['title'])}</b> в тенге.\n\n"
-        "Пример: <code>1500</code>\n"
+        f"Введите новую цену для <b>{safe(item['title'])}</b> в тенге или рублях.\n\n"
+        "Пример: <code>1500</code> или <code>250₽</code>\n"
         "Для товаров по договорённости можно поставить <code>0</code>.",
         reply_markup=back_menu_kb(),
     )
@@ -1406,12 +1504,15 @@ async def admin_product_price_handler(callback: CallbackQuery, state: FSMContext
 async def admin_product_price_text_handler(message: Message, state: FSMContext) -> None:
     if not can_manage_settings(message.from_user.id):
         return
-    raw = (message.text or "").replace(" ", "").replace(",", ".")
-    try:
-        price = float(raw)
-    except ValueError:
-        await message.answer("Введите цену цифрами. Например: 1500")
-        return
+    raw = (message.text or "").strip()
+    if raw in {"0", "0₸", "0р", "0₽"}:
+        price = 0.0
+    else:
+        try:
+            price, detected_currency, original_amount = parse_amount(raw, "KZT")
+        except ValueError:
+            await message.answer("Введите цену цифрами. Например: 1500 или 250₽")
+            return
     if price < 0:
         await message.answer("Цена не может быть отрицательной.")
         return
@@ -1426,7 +1527,7 @@ async def admin_product_price_text_handler(message: Message, state: FSMContext) 
     await message.answer(
         f"✅ Цена обновлена.\n\n"
         f"Товар: <b>{safe(item['title']) if item else safe(sku)}</b>\n"
-        f"Новая цена: <b>{money(price) if price > 0 else 'договорная'}</b>",
+        f"Новая цена: <b>{money_multi(price) if price > 0 else 'договорная'}</b>",
         reply_markup=admin_product_kb(sku),
     )
 
@@ -1861,6 +1962,8 @@ async def create_ton_payment_order(
         price=price,
         payment_method="TON",
         status="waiting_ton",
+        currency=user_currency(user_id),
+        display_amount=kzt_to_currency(price, user_currency(user_id)),
     )
     current_rate = get_ton_rate_kzt()
     amount_ton = kzt_to_ton(price)
@@ -1874,9 +1977,9 @@ async def create_ton_payment_order(
     await target_message.answer(
         f"💎 <b>TON-оплата заказа #{order_id}</b>\n\n"
         f"📦 Товар: <b>{safe(product)}</b>\n"
-        f"💵 Сумма: <b>{money(price)}</b>\n"
+        f"💵 Сумма: <b>{money_multi(price)}</b>\n"
         f"💎 К оплате: <b>{amount_ton:g} TON</b>\n"
-        f"📈 Курс: <b>1 TON ≈ {money(current_rate)}</b>\n\n"
+        f"📈 Курс: <b>1 TON ≈ {format_money(current_rate, 'KZT')} / {format_money(current_rate, 'RUB')}</b>\n\n"
         f"Отправьте ровно или больше <b>{amount_ton:g} TON</b> на адрес:\n"
         f"<code>{safe(settings.ton_wallet)}</code>\n\n"
         f"Комментарий к платежу обязательно:\n"
@@ -1954,7 +2057,7 @@ async def process_ton_paid_order(bot: Bot, order_id: int, tx_hash: str, amount_t
         try:
             await bot.send_message(
                 int(order["user_id"]),
-                f"✅ TON-оплата найдена. Баланс пополнен на <b>{money(float(order['price'] or 0))}</b>.",
+                f"✅ TON-оплата найдена. Баланс пополнен на <b>{money_multi(float(order['price'] or 0))}</b>.",
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Cannot notify topup user %s: %s", order["user_id"], exc)
