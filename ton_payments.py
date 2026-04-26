@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import time
 import urllib.parse
 import urllib.request
 from typing import Any
@@ -11,15 +12,50 @@ from config import settings
 from database import is_ton_tx_used
 
 NANO = 1_000_000_000
+_rate_cache: dict[str, float] = {"value": 0.0, "ts": 0.0}
+
+
+def get_ton_rate_kzt(force: bool = False) -> float:
+    """Возвращает курс 1 TON в KZT.
+
+    Если TON_RATE_AUTO_ENABLED=1, бот пробует взять актуальный курс через публичный API.
+    Если API недоступен, используется ручной fallback TON_RATE_KZT из Railway.
+    """
+    fallback = float(settings.ton_rate_kzt or 0)
+    if not settings.ton_rate_auto_enabled:
+        return fallback
+
+    ttl = max(60, int(settings.ton_rate_cache_minutes or 15) * 60)
+    now_ts = time.time()
+    if not force and _rate_cache["value"] > 0 and now_ts - _rate_cache["ts"] < ttl:
+        return float(_rate_cache["value"])
+
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=kzt"
+        request = urllib.request.Request(url, headers={"User-Agent": "GamePayBot/1.0"})
+        with urllib.request.urlopen(request, timeout=12) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        value = float(data.get("the-open-network", {}).get("kzt") or 0)
+        if value > 0:
+            _rate_cache["value"] = value
+            _rate_cache["ts"] = now_ts
+            return value
+    except Exception:
+        pass
+
+    return fallback
 
 
 def ton_is_configured() -> bool:
-    return bool(settings.ton_wallet and settings.ton_api_key and settings.ton_rate_kzt > 0)
+    return bool(settings.ton_wallet and settings.ton_api_key and get_ton_rate_kzt() > 0)
 
 
 def kzt_to_ton(amount_kzt: float) -> float:
     # Округляем вверх до 0.001 TON, чтобы клиент не отправил меньше нужного.
-    raw = float(amount_kzt) / float(settings.ton_rate_kzt)
+    rate = get_ton_rate_kzt()
+    if rate <= 0:
+        return 0.0
+    raw = float(amount_kzt) / rate
     return math.ceil(raw * 1000) / 1000
 
 
