@@ -107,7 +107,22 @@ def init_db() -> None:
             status TEXT DEFAULT 'open',
             created_at TEXT NOT NULL,
             answered_at TEXT,
-            closed_at TEXT
+            closed_at TEXT,
+            last_message_at TEXT
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS support_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER NOT NULL,
+            sender TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            message TEXT NOT NULL,
+            created_at TEXT NOT NULL
         )
         """
     )
@@ -121,6 +136,31 @@ def init_db() -> None:
         cur.execute("ALTER TABLE support_tickets ADD COLUMN answered_at TEXT")
     if "closed_at" not in ticket_columns:
         cur.execute("ALTER TABLE support_tickets ADD COLUMN closed_at TEXT")
+    if "last_message_at" not in ticket_columns:
+        cur.execute("ALTER TABLE support_tickets ADD COLUMN last_message_at TEXT")
+
+    # Переносим старые тикеты в таблицу истории сообщений, если у тикета ещё нет истории.
+    cur.execute("SELECT id, user_id, username, message, admin_reply, created_at, answered_at FROM support_tickets")
+    for ticket in cur.fetchall():
+        cur.execute("SELECT COUNT(*) FROM support_messages WHERE ticket_id=?", (ticket["id"],))
+        if int(cur.fetchone()[0] or 0) == 0:
+            if ticket["message"]:
+                cur.execute(
+                    """
+                    INSERT INTO support_messages (ticket_id, sender, user_id, username, message, created_at)
+                    VALUES (?, 'user', ?, ?, ?, ?)
+                    """,
+                    (ticket["id"], ticket["user_id"], ticket["username"] or "", ticket["message"], ticket["created_at"] or now()),
+                )
+            if ticket["admin_reply"]:
+                cur.execute(
+                    """
+                    INSERT INTO support_messages (ticket_id, sender, user_id, username, message, created_at)
+                    VALUES (?, 'admin', ?, 'admin', ?, ?)
+                    """,
+                    (ticket["id"], settings.admin_id or 0, ticket["admin_reply"], ticket["answered_at"] or now()),
+                )
+            cur.execute("UPDATE support_tickets SET last_message_at=COALESCE(last_message_at, ?) WHERE id=?", (now(), ticket["id"]))
 
     conn.commit()
     conn.close()
@@ -312,11 +352,22 @@ def activate_promocode(code: str, user_id: int) -> tuple[bool, str, float]:
 def create_support_ticket(user_id: int, username: str | None, message: str) -> int:
     conn = db_connect()
     cur = conn.cursor()
+    created = now()
     cur.execute(
-        "INSERT INTO support_tickets (user_id, username, message, created_at) VALUES (?, ?, ?, ?)",
-        (user_id, username or "", message, now()),
+        """
+        INSERT INTO support_tickets (user_id, username, message, status, created_at, last_message_at)
+        VALUES (?, ?, ?, 'open', ?, ?)
+        """,
+        (user_id, username or "", message, created, created),
     )
     ticket_id = int(cur.lastrowid)
+    cur.execute(
+        """
+        INSERT INTO support_messages (ticket_id, sender, user_id, username, message, created_at)
+        VALUES (?, 'user', ?, ?, ?, ?)
+        """,
+        (ticket_id, user_id, username or "", message, created),
+    )
     conn.commit()
     conn.close()
     return ticket_id
@@ -331,7 +382,64 @@ def get_support_ticket(ticket_id: int) -> sqlite3.Row | None:
     return ticket
 
 
-def answer_support_ticket(ticket_id: int, reply_text: str) -> sqlite3.Row | None:
+def list_user_support_tickets(user_id: int, limit: int = 10) -> list[sqlite3.Row]:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM support_tickets
+        WHERE user_id=?
+        ORDER BY COALESCE(last_message_at, created_at) DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def list_active_support_tickets(limit: int = 20) -> list[sqlite3.Row]:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM support_tickets
+        WHERE status != 'closed'
+        ORDER BY COALESCE(last_message_at, created_at) DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_ticket_messages(ticket_id: int, limit: int = 20) -> list[sqlite3.Row]:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM support_messages
+        WHERE ticket_id=?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (ticket_id, limit),
+    )
+    rows = list(reversed(cur.fetchall()))
+    conn.close()
+    return rows
+
+
+def add_support_message(
+    ticket_id: int,
+    sender: str,
+    user_id: int,
+    username: str | None,
+    message: str,
+) -> sqlite3.Row | None:
     conn = db_connect()
     cur = conn.cursor()
     cur.execute("SELECT * FROM support_tickets WHERE id=?", (ticket_id,))
@@ -339,10 +447,38 @@ def answer_support_ticket(ticket_id: int, reply_text: str) -> sqlite3.Row | None
     if not ticket:
         conn.close()
         return None
+    if ticket["status"] == "closed":
+        conn.close()
+        return None
+
+    created = now()
     cur.execute(
-        "UPDATE support_tickets SET admin_reply=?, status='answered', answered_at=? WHERE id=?",
-        (reply_text, now(), ticket_id),
+        """
+        INSERT INTO support_messages (ticket_id, sender, user_id, username, message, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (ticket_id, sender, user_id, username or "", message, created),
     )
+
+    if sender == "admin":
+        cur.execute(
+            """
+            UPDATE support_tickets
+            SET admin_reply=?, status='answered', answered_at=?, last_message_at=?
+            WHERE id=?
+            """,
+            (message, created, created, ticket_id),
+        )
+    else:
+        cur.execute(
+            """
+            UPDATE support_tickets
+            SET message=?, status='open', last_message_at=?
+            WHERE id=?
+            """,
+            (message, created, ticket_id),
+        )
+
     conn.commit()
     cur.execute("SELECT * FROM support_tickets WHERE id=?", (ticket_id,))
     updated = cur.fetchone()
@@ -350,12 +486,16 @@ def answer_support_ticket(ticket_id: int, reply_text: str) -> sqlite3.Row | None
     return updated
 
 
+def answer_support_ticket(ticket_id: int, reply_text: str) -> sqlite3.Row | None:
+    return add_support_message(ticket_id, "admin", settings.admin_id or 0, "admin", reply_text)
+
+
 def count_user_support_tickets(user_id: int) -> dict[str, int]:
     conn = db_connect()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM support_tickets WHERE user_id=?", (user_id,))
     total = int(cur.fetchone()[0] or 0)
-    cur.execute("SELECT COUNT(*) FROM support_tickets WHERE user_id=? AND status='open'", (user_id,))
+    cur.execute("SELECT COUNT(*) FROM support_tickets WHERE user_id=? AND status!='closed'", (user_id,))
     open_count = int(cur.fetchone()[0] or 0)
     conn.close()
     return {"total": total, "open": open_count}
@@ -364,7 +504,7 @@ def count_user_support_tickets(user_id: int) -> dict[str, int]:
 def close_support_ticket(ticket_id: int) -> bool:
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("UPDATE support_tickets SET status='closed', closed_at=? WHERE id=?", (now(), ticket_id))
+    cur.execute("UPDATE support_tickets SET status='closed', closed_at=?, last_message_at=? WHERE id=?", (now(), now(), ticket_id))
     changed = cur.rowcount > 0
     conn.commit()
     conn.close()
