@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from config import settings
+from currency_utils import normalize_currency, kzt_to_currency
 
 
 def now() -> str:
@@ -34,6 +35,7 @@ def init_db() -> None:
             full_name TEXT,
             balance REAL DEFAULT 0,
             ref_by INTEGER,
+            currency TEXT DEFAULT 'KZT',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -50,6 +52,8 @@ def init_db() -> None:
             product TEXT NOT NULL,
             details TEXT,
             price REAL DEFAULT 0,
+            currency TEXT DEFAULT 'KZT',
+            display_amount REAL DEFAULT 0,
             payment_method TEXT DEFAULT 'manual',
             status TEXT DEFAULT 'new',
             reward_paid INTEGER DEFAULT 0,
@@ -197,6 +201,19 @@ def init_db() -> None:
     if "last_message_at" not in ticket_columns:
         cur.execute("ALTER TABLE support_tickets ADD COLUMN last_message_at TEXT")
 
+    # Миграции мультивалютности.
+    cur.execute("PRAGMA table_info(users)")
+    user_columns = {row[1] for row in cur.fetchall()}
+    if "currency" not in user_columns:
+        cur.execute("ALTER TABLE users ADD COLUMN currency TEXT DEFAULT 'KZT'")
+
+    cur.execute("PRAGMA table_info(orders)")
+    order_columns = {row[1] for row in cur.fetchall()}
+    if "currency" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN currency TEXT DEFAULT 'KZT'")
+    if "display_amount" not in order_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN display_amount REAL DEFAULT 0")
+
     # Переносим старые тикеты в таблицу истории сообщений, если у тикета ещё нет истории.
     cur.execute("SELECT id, user_id, username, message, admin_reply, created_at, answered_at FROM support_tickets")
     for ticket in cur.fetchall():
@@ -262,6 +279,36 @@ def get_user(user_id: int, conn: sqlite3.Connection | None = None) -> sqlite3.Ro
     return row
 
 
+def get_user_currency(user_id: int) -> str:
+    user = get_user(user_id)
+    if not user:
+        return normalize_currency(settings.default_currency)
+    try:
+        return normalize_currency(user["currency"])
+    except Exception:
+        return normalize_currency(settings.default_currency)
+
+
+def set_user_currency(user_id: int, currency: str) -> str:
+    code = normalize_currency(currency)
+    conn = db_connect()
+    cur = conn.cursor()
+    user = get_user(user_id, conn=conn)
+    if not user:
+        cur.execute(
+            """
+            INSERT INTO users (user_id, username, full_name, balance, ref_by, currency, created_at, updated_at)
+            VALUES (?, '', '', 0, NULL, ?, ?, ?)
+            """,
+            (user_id, code, now(), now()),
+        )
+    else:
+        cur.execute("UPDATE users SET currency=?, updated_at=? WHERE user_id=?", (code, now(), user_id))
+    conn.commit()
+    conn.close()
+    return code
+
+
 def get_users(limit: int = 10000) -> list[sqlite3.Row]:
     conn = db_connect()
     cur = conn.cursor()
@@ -307,15 +354,30 @@ def create_order(
     price: float = 0,
     payment_method: str = "manual",
     status: str = "new",
+    currency: str = "KZT",
+    display_amount: float | None = None,
 ) -> int:
     conn = db_connect()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO orders (user_id, username, category, product, details, price, payment_method, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO orders (user_id, username, category, product, details, price, currency, display_amount, payment_method, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (user_id, username or "", category, product, details, float(price), payment_method, status, now(), now()),
+        (
+            user_id,
+            username or "",
+            category,
+            product,
+            details,
+            float(price),
+            normalize_currency(currency),
+            float(display_amount if display_amount is not None else kzt_to_currency(float(price), currency)),
+            payment_method,
+            status,
+            now(),
+            now(),
+        ),
     )
     order_id = int(cur.lastrowid)
     conn.commit()
