@@ -15,10 +15,8 @@ from aiogram.types import CallbackQuery, Message
 
 from config import settings
 from database import (
-    activate_promocode,
     change_balance,
     create_order,
-    create_promocode,
     create_support_ticket,
     count_user_support_tickets,
     close_support_ticket,
@@ -61,7 +59,7 @@ from keyboards import (
     ton_invoice_kb,
 )
 from products import CUSTOM_PRODUCTS, PREMIUM_PACKAGES, PUBG_PACKAGES, STARS_PACKAGES
-from states import AdminBroadcastFSM, AdminPromoFSM, AdminTicketFSM, CalculatorFSM, OrderFSM, PromoFSM, PubgFSM, SupportFSM, TopUpFSM
+from states import AdminBroadcastFSM, AdminTicketFSM, CalculatorFSM, OrderFSM, PubgFSM, SupportFSM, TopUpFSM
 from texts import INFO_TEXT, MENU_TEXT
 from ton_payments import find_ton_payment, kzt_to_ton, ton_invoice_comment, ton_is_configured
 
@@ -553,7 +551,7 @@ async def pubg_package_handler(callback: CallbackQuery, state: FSMContext) -> No
 
 
 # =========================
-# TOP UP / PROMO / SUPPORT
+# TOP UP / SUPPORT
 # =========================
 
 
@@ -610,23 +608,8 @@ async def topup_custom_amount_handler(message: Message, state: FSMContext) -> No
         state=state,
     )
 @router.callback_query(F.data == "promo")
-async def promo_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(PromoFSM.waiting_code)
-    await callback.message.answer("🎟 Введите промокод:", reply_markup=back_menu_kb())
-    await callback.answer()
-
-
-@router.message(PromoFSM.waiting_code)
-async def promo_code_handler(message: Message, state: FSMContext) -> None:
-    code = (message.text or "").strip()
-    upsert_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
-    ok, result, amount = activate_promocode(code, message.from_user.id)
-    await state.clear()
-    if ok:
-        await message.answer(f"✅ {safe(result)}", reply_markup=back_menu_kb())
-    else:
-        await message.answer(f"❌ {safe(result)}", reply_markup=back_menu_kb())
-
+async def promo_disabled_handler(callback: CallbackQuery) -> None:
+    await callback.answer("Промокоды отключены", show_alert=True)
 
 def support_panel_text(user_id: int) -> str:
     stats = count_user_support_tickets(user_id)
@@ -1024,68 +1007,11 @@ async def admin_cancel_handler(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "admin_create_promo")
-async def admin_create_promo_handler(callback: CallbackQuery, state: FSMContext) -> None:
+async def admin_create_promo_disabled_handler(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    await state.set_state(AdminPromoFSM.waiting_code)
-    await callback.message.answer("Введите код промокода.\n\nПример: START100")
-    await callback.answer()
-
-
-@router.message(AdminPromoFSM.waiting_code)
-async def admin_promo_code_handler(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        return
-    code = (message.text or "").strip().upper().replace(" ", "")
-    if len(code) < 3:
-        await message.answer("Код слишком короткий. Пример: START100")
-        return
-    await state.update_data(code=code)
-    await state.set_state(AdminPromoFSM.waiting_amount)
-    await message.answer("Введите сумму бонуса на баланс.\n\nПример: 100")
-
-
-@router.message(AdminPromoFSM.waiting_amount)
-async def admin_promo_amount_handler(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        amount = float((message.text or "").replace(",", "."))
-    except ValueError:
-        await message.answer("Введите сумму цифрами.")
-        return
-    if amount <= 0:
-        await message.answer("Сумма должна быть больше 0.")
-        return
-    await state.update_data(amount=amount)
-    await state.set_state(AdminPromoFSM.waiting_limit)
-    await message.answer("Введите лимит активаций.\n\nПример: 10")
-
-
-@router.message(AdminPromoFSM.waiting_limit)
-async def admin_promo_limit_handler(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        limit = int((message.text or "").strip())
-    except ValueError:
-        await message.answer("Введите лимит цифрами.")
-        return
-    if limit <= 0:
-        await message.answer("Лимит должен быть больше 0.")
-        return
-    data = await state.get_data()
-    create_promocode(data["code"], float(data["amount"]), limit)
-    await state.clear()
-    await message.answer(
-        f"✅ Промокод создан:\n\n"
-        f"Код: <code>{safe(data['code'])}</code>\n"
-        f"Бонус: <b>{money(float(data['amount']))}</b>\n"
-        f"Лимит: <b>{limit}</b>",
-        reply_markup=admin_panel_kb(),
-    )
-
+    await callback.answer("Промокоды отключены", show_alert=True)
 
 @router.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_handler(callback: CallbackQuery, state: FSMContext) -> None:
