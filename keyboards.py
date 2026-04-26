@@ -43,10 +43,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📞 Поддержка", callback_data="support"),
                 InlineKeyboardButton(text="🧮 Калькулятор", callback_data="calculator"),
             ],
-            [
-                InlineKeyboardButton(text="🎟 Промокод", callback_data="promo"),
-                InlineKeyboardButton(text="ℹ️ Информация", callback_data="info"),
-            ],
+            [InlineKeyboardButton(text="ℹ️ Информация", callback_data="info")],
             [InlineKeyboardButton(text="🏆 Топ клиентов", callback_data="top_clients")],
             [InlineKeyboardButton(text="🤝 Стать партнёром", callback_data="partner")],
         ]
@@ -146,7 +143,6 @@ def profile_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📦 Мои заказы", callback_data="my_orders")],
-            [InlineKeyboardButton(text="🎟 Активировать промокод", callback_data="promo")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")],
         ]
     )
@@ -171,10 +167,7 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📦 Новые заказы", callback_data="admin_orders"),
                 InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"),
             ],
-            [
-                InlineKeyboardButton(text="🎟 Создать промокод", callback_data="admin_create_promo"),
-                InlineKeyboardButton(text="📣 Рассылка", callback_data="admin_broadcast"),
-            ],
+            [InlineKeyboardButton(text="📣 Рассылка", callback_data="admin_broadcast")],
             [InlineKeyboardButton(text="⬅️ Меню клиента", callback_data="back_menu")],
         ]
     )
