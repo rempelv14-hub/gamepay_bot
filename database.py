@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import os
 import sqlite3
 from datetime import datetime
@@ -73,6 +74,22 @@ def init_db() -> None:
 
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS refunds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            amount_kzt REAL NOT NULL,
+            amount_ton REAL DEFAULT 0,
+            method TEXT NOT NULL,
+            status TEXT DEFAULT 'done',
+            note TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS promocodes (
             code TEXT PRIMARY KEY,
             amount REAL NOT NULL,
@@ -127,6 +144,47 @@ def init_db() -> None:
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS product_items (
+            sku TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            code TEXT NOT NULL,
+            title TEXT NOT NULL,
+            price REAL DEFAULT 0,
+            enabled INTEGER DEFAULT 1,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS no_comment_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            message TEXT NOT NULL,
+            status TEXT DEFAULT 'new',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL UNIQUE,
+            user_id INTEGER NOT NULL,
+            rating INTEGER NOT NULL,
+            comment TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
     # Миграции для старых баз Railway: добавляем поля тикетов, если их ещё нет.
     cur.execute("PRAGMA table_info(support_tickets)")
     ticket_columns = {row[1] for row in cur.fetchall()}
@@ -165,18 +223,21 @@ def init_db() -> None:
     conn.commit()
     conn.close()
     ensure_ton_tables()
+    seed_product_catalog()
 
 
-def upsert_user(user_id: int, username: str | None, full_name: str | None, ref_by: int | None = None) -> None:
+def upsert_user(user_id: int, username: str | None, full_name: str | None, ref_by: int | None = None) -> bool:
     conn = db_connect()
     cur = conn.cursor()
     existing = get_user(user_id, conn=conn)
+    was_new = False
     if existing:
         cur.execute(
             "UPDATE users SET username=?, full_name=?, updated_at=? WHERE user_id=?",
             (username or "", full_name or "", now(), user_id),
         )
     else:
+        was_new = True
         safe_ref = ref_by if ref_by and ref_by != user_id else None
         cur.execute(
             """
@@ -187,6 +248,7 @@ def upsert_user(user_id: int, username: str | None, full_name: str | None, ref_b
         )
     conn.commit()
     conn.close()
+    return was_new
 
 
 def get_user(user_id: int, conn: sqlite3.Connection | None = None) -> sqlite3.Row | None:
@@ -303,6 +365,42 @@ def mark_reward_paid(order_id: int) -> None:
     cur.execute("UPDATE orders SET reward_paid=1, updated_at=? WHERE id=?", (now(), order_id))
     conn.commit()
     conn.close()
+
+
+def get_refund_by_order(order_id: int) -> sqlite3.Row | None:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM refunds WHERE order_id=? ORDER BY id DESC LIMIT 1", (order_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def create_refund_record(
+    order_id: int,
+    user_id: int,
+    amount_kzt: float,
+    amount_ton: float = 0,
+    method: str = "balance",
+    status: str = "done",
+    note: str | None = None,
+) -> int:
+    existing = get_refund_by_order(order_id)
+    if existing:
+        return int(existing["id"])
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO refunds (order_id, user_id, amount_kzt, amount_ton, method, status, note, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (order_id, user_id, float(amount_kzt), float(amount_ton), method, status, note or "", now()),
+    )
+    refund_id = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return refund_id
 
 
 def create_promocode(code: str, amount: float, max_uses: int) -> None:
@@ -582,6 +680,177 @@ def get_user_activity_stats(user_id: int) -> dict[str, Any]:
     }
 
 # =========================
+# PRODUCTS / ADMIN EXTRA
+# =========================
+
+def seed_product_catalog() -> None:
+    from products import CUSTOM_PRODUCTS, PREMIUM_PACKAGES, PUBG_PACKAGES, STARS_PACKAGES, TOP_UP_AMOUNTS
+
+    conn = db_connect()
+    cur = conn.cursor()
+    items: list[tuple[str, str, str, str, float]] = []
+    for code, price in STARS_PACKAGES.items():
+        items.append((f"stars:{code}", "stars", str(code), f"⭐ {code} Stars", float(price)))
+    for code, price in PREMIUM_PACKAGES.items():
+        items.append((f"premium:{code}", "premium", str(code), f"👑 Premium {code} мес.", float(price)))
+    for code, price in PUBG_PACKAGES.items():
+        items.append((f"pubg:{code}", "pubg", str(code), f"🎮 PUBG {code} UC", float(price)))
+    for amount in TOP_UP_AMOUNTS:
+        items.append((f"topup:{amount}", "topup", str(amount), f"💰 Пополнение {amount:g}", float(amount)))
+    for key, item in CUSTOM_PRODUCTS.items():
+        items.append((f"custom:{key}", "custom", key, str(item["title"]), 0.0))
+
+    for sku, kind, code, title, price in items:
+        cur.execute("SELECT 1 FROM product_items WHERE sku=?", (sku,))
+        if cur.fetchone() is None:
+            cur.execute(
+                "INSERT INTO product_items (sku, kind, code, title, price, enabled, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
+                (sku, kind, code, title, price, now()),
+            )
+    conn.commit()
+    conn.close()
+
+
+def get_product_item(sku: str) -> sqlite3.Row | None:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM product_items WHERE sku=?", (sku,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def list_product_items(kind: str | None = None, include_disabled: bool = True) -> list[sqlite3.Row]:
+    conn = db_connect()
+    cur = conn.cursor()
+    if kind:
+        if include_disabled:
+            cur.execute("SELECT * FROM product_items WHERE kind=? ORDER BY kind, CAST(code AS INTEGER), code", (kind,))
+        else:
+            cur.execute("SELECT * FROM product_items WHERE kind=? AND enabled=1 ORDER BY kind, CAST(code AS INTEGER), code", (kind,))
+    else:
+        cur.execute("SELECT * FROM product_items ORDER BY kind, CAST(code AS INTEGER), code")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_product_price(kind: str, code: str, default: float = 0.0) -> float:
+    row = get_product_item(f"{kind}:{code}")
+    if row:
+        return float(row["price"] or 0)
+    return float(default)
+
+
+def is_product_enabled(sku: str) -> bool:
+    row = get_product_item(sku)
+    if not row:
+        return True
+    return int(row["enabled"] or 0) == 1
+
+
+def set_product_price(sku: str, price: float) -> bool:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE product_items SET price=?, updated_at=? WHERE sku=?", (float(price), now(), sku))
+    changed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def toggle_product_enabled(sku: str) -> bool | None:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT enabled FROM product_items WHERE sku=?", (sku,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return None
+    new_value = 0 if int(row["enabled"] or 0) == 1 else 1
+    cur.execute("UPDATE product_items SET enabled=?, updated_at=? WHERE sku=?", (new_value, now(), sku))
+    conn.commit()
+    conn.close()
+    return bool(new_value)
+
+
+def create_no_comment_report(order_id: int | None, user_id: int, username: str | None, message: str) -> int:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO no_comment_reports (order_id, user_id, username, message, status, created_at) VALUES (?, ?, ?, ?, 'new', ?)",
+        (order_id, user_id, username or "", message, now()),
+    )
+    report_id = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return report_id
+
+
+def create_review(order_id: int, user_id: int, rating: int, comment: str | None = None) -> tuple[bool, str]:
+    conn = db_connect()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO reviews (order_id, user_id, rating, comment, created_at) VALUES (?, ?, ?, ?, ?)",
+            (order_id, user_id, int(rating), comment or "", now()),
+        )
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False, "Вы уже оставили отзыв по этому заказу."
+    conn.commit()
+    conn.close()
+    return True, "Спасибо за отзыв!"
+
+
+def get_admin_stats_expanded() -> dict[str, Any]:
+    conn = db_connect()
+    cur = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
+    month = datetime.now().strftime("%Y-%m")
+
+    def one(query: str, params: tuple[Any, ...] = ()) -> Any:
+        cur.execute(query, params)
+        return cur.fetchone()[0]
+
+    data = {
+        "users_count": int(one("SELECT COUNT(*) FROM users") or 0),
+        "new_users_today": int(one("SELECT COUNT(*) FROM users WHERE substr(created_at,1,10)=?", (today,)) or 0),
+        "orders_count": int(one("SELECT COUNT(*) FROM orders") or 0),
+        "orders_today": int(one("SELECT COUNT(*) FROM orders WHERE substr(created_at,1,10)=?", (today,)) or 0),
+        "paid_today": float(one("SELECT COALESCE(SUM(price),0) FROM orders WHERE status IN ('paid','work','done') AND substr(updated_at,1,10)=?", (today,)) or 0),
+        "paid_month": float(one("SELECT COALESCE(SUM(price),0) FROM orders WHERE status IN ('paid','work','done') AND substr(updated_at,1,7)=?", (month,)) or 0),
+        "done_orders": int(one("SELECT COUNT(*) FROM orders WHERE status='done'") or 0),
+        "cancelled_orders": int(one("SELECT COUNT(*) FROM orders WHERE status='cancelled'") or 0),
+        "waiting_ton": int(one("SELECT COUNT(*) FROM orders WHERE status='waiting_ton'") or 0),
+        "active_orders": int(one("SELECT COUNT(*) FROM orders WHERE status IN ('new','paid','work','waiting_ton')") or 0),
+        "open_tickets": int(one("SELECT COUNT(*) FROM support_tickets WHERE status!='closed'") or 0),
+        "reviews_count": int(one("SELECT COUNT(*) FROM reviews") or 0),
+        "avg_rating": float(one("SELECT COALESCE(AVG(rating),0) FROM reviews") or 0),
+    }
+    conn.close()
+    return data
+
+
+def export_table_to_csv(table: str, filepath: str) -> None:
+    allowed = {"users", "orders", "transactions", "refunds", "support_tickets", "support_messages", "ton_invoices", "reviews", "no_comment_reports"}
+    if table not in allowed:
+        raise ValueError("Недоступная таблица для экспорта")
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(f"SELECT * FROM {table}")
+    rows = cur.fetchall()
+    fieldnames = [desc[0] for desc in cur.description]
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(fieldnames)
+        for row in rows:
+            writer.writerow([row[name] for name in fieldnames])
+    conn.close()
+
+
+# =========================
 # TON INVOICES
 # =========================
 
@@ -600,7 +869,8 @@ def ensure_ton_tables() -> None:
             status TEXT DEFAULT 'pending',
             tx_hash TEXT,
             created_at TEXT NOT NULL,
-            paid_at TEXT
+            paid_at TEXT,
+            expires_at TEXT
         )
         """
     )
@@ -615,20 +885,24 @@ def ensure_ton_tables() -> None:
         )
         """
     )
+    cur.execute("PRAGMA table_info(ton_invoices)")
+    ton_columns = {row[1] for row in cur.fetchall()}
+    if "expires_at" not in ton_columns:
+        cur.execute("ALTER TABLE ton_invoices ADD COLUMN expires_at TEXT")
     conn.commit()
     conn.close()
 
 
-def create_ton_invoice(order_id: int, user_id: int, amount_kzt: float, amount_ton: float, comment: str) -> int:
+def create_ton_invoice(order_id: int, user_id: int, amount_kzt: float, amount_ton: float, comment: str, expires_at: str | None = None) -> int:
     ensure_ton_tables()
     conn = db_connect()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO ton_invoices (order_id, user_id, amount_kzt, amount_ton, comment, status, created_at)
-        VALUES (?, ?, ?, ?, ?, 'pending', ?)
+        INSERT INTO ton_invoices (order_id, user_id, amount_kzt, amount_ton, comment, status, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
         """,
-        (order_id, user_id, float(amount_kzt), float(amount_ton), comment, now()),
+        (order_id, user_id, float(amount_kzt), float(amount_ton), comment, now(), expires_at),
     )
     invoice_id = int(cur.lastrowid)
     conn.commit()
@@ -691,5 +965,14 @@ def mark_ton_invoice_paid(order_id: int, tx_hash: str, amount_ton: float) -> Non
         "INSERT OR IGNORE INTO ton_used_transactions (tx_hash, order_id, user_id, amount_ton, created_at) VALUES (?, ?, ?, ?, ?)",
         (tx_hash, order_id, int(invoice['user_id']), float(amount_ton), now()),
     )
+    conn.commit()
+    conn.close()
+
+
+def expire_ton_invoice(order_id: int) -> None:
+    ensure_ton_tables()
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE ton_invoices SET status='expired' WHERE order_id=? AND status='pending'", (order_id,))
     conn.commit()
     conn.close()
