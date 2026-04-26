@@ -1,4 +1,4 @@
-from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.state import State, StatesGroup
 
 
 class OrderFSM(StatesGroup):
@@ -32,6 +32,14 @@ class AdminTicketFSM(StatesGroup):
 
 class AdminOrderFSM(StatesGroup):
     waiting_message = State()
+
+
+class AdminProductFSM(StatesGroup):
+    waiting_price = State()
+
+
+class NoCommentFSM(StatesGroup):
+    waiting_report = State()
 
 
 class CalculatorFSM(StatesGroup):
