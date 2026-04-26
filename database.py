@@ -103,11 +103,24 @@ def init_db() -> None:
             user_id INTEGER NOT NULL,
             username TEXT,
             message TEXT NOT NULL,
+            admin_reply TEXT,
             status TEXT DEFAULT 'open',
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            answered_at TEXT,
+            closed_at TEXT
         )
         """
     )
+
+    # Миграции для старых баз Railway: добавляем поля тикетов, если их ещё нет.
+    cur.execute("PRAGMA table_info(support_tickets)")
+    ticket_columns = {row[1] for row in cur.fetchall()}
+    if "admin_reply" not in ticket_columns:
+        cur.execute("ALTER TABLE support_tickets ADD COLUMN admin_reply TEXT")
+    if "answered_at" not in ticket_columns:
+        cur.execute("ALTER TABLE support_tickets ADD COLUMN answered_at TEXT")
+    if "closed_at" not in ticket_columns:
+        cur.execute("ALTER TABLE support_tickets ADD COLUMN closed_at TEXT")
 
     conn.commit()
     conn.close()
@@ -309,6 +322,34 @@ def create_support_ticket(user_id: int, username: str | None, message: str) -> i
     return ticket_id
 
 
+def get_support_ticket(ticket_id: int) -> sqlite3.Row | None:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM support_tickets WHERE id=?", (ticket_id,))
+    ticket = cur.fetchone()
+    conn.close()
+    return ticket
+
+
+def answer_support_ticket(ticket_id: int, reply_text: str) -> sqlite3.Row | None:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM support_tickets WHERE id=?", (ticket_id,))
+    ticket = cur.fetchone()
+    if not ticket:
+        conn.close()
+        return None
+    cur.execute(
+        "UPDATE support_tickets SET admin_reply=?, status='answered', answered_at=? WHERE id=?",
+        (reply_text, now(), ticket_id),
+    )
+    conn.commit()
+    cur.execute("SELECT * FROM support_tickets WHERE id=?", (ticket_id,))
+    updated = cur.fetchone()
+    conn.close()
+    return updated
+
+
 def count_user_support_tickets(user_id: int) -> dict[str, int]:
     conn = db_connect()
     cur = conn.cursor()
@@ -323,7 +364,7 @@ def count_user_support_tickets(user_id: int) -> dict[str, int]:
 def close_support_ticket(ticket_id: int) -> bool:
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("UPDATE support_tickets SET status='closed' WHERE id=?", (ticket_id,))
+    cur.execute("UPDATE support_tickets SET status='closed', closed_at=? WHERE id=?", (now(), ticket_id))
     changed = cur.rowcount > 0
     conn.commit()
     conn.close()
